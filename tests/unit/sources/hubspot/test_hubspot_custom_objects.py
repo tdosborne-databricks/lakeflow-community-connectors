@@ -425,3 +425,47 @@ def test_unknown_association_object_types_are_skipped_not_fatal(generated):
     assert "companies" in associations
     # None of the unmapped internal types leaked an association column in.
     assert not any(name.startswith(("0-", "2-")) for name in associations)
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_custom_object_archived_records_are_emitted_as_deletes(generated):
+    """Custom objects do support archived listing.
+
+    Without a delete flow an archived custom record never leaves the
+    destination and keeps looking active, so a discovered custom object must
+    opt into deletes and surface archived records through read_table_deletes.
+    """
+    archived_at = "2024-03-02T00:00:00Z"
+    seen_queries = []
+
+    def get(url, **_kwargs):
+        path = urlparse(url).path
+        query = parse_qs(urlparse(url).query)
+        if path == "/crm-object-schemas/2026-09/schemas":
+            return _Response({"results": [{"name": "Cars", "objectTypeId": "2-12345"}]})
+        if path == "/crm/properties/2026-09/2-12345":
+            return _Response({"results": [{"name": "vin", "type": "string"}]})
+        assert path == "/crm/objects/2026-09/2-12345"
+        seen_queries.append(query)
+        if query.get("archived") == ["true"]:
+            return _Response({"results": [{
+                "id": "9",
+                "archived": True,
+                "archivedAt": archived_at,
+                "properties": {"vin": "archived-vin"},
+            }]})
+        return _Response({"results": []})
+
+    conn = _connector_class(generated)({"access_token": "test-only-token"})
+    conn._init_ts = "2024-03-04T00:00:00.000Z"
+    with mock.patch("requests.get", side_effect=get):
+        assert conn.read_table_metadata("cars", {})["ingestion_type"] == "cdc_with_deletes"
+        rows, offset = conn.read_table_deletes(
+            "cars", {"updatedAt": "2024-02-01T00:00:00.000Z"}, {}
+        )
+    rows = list(rows)
+    assert [row["id"] for row in rows] == ["9"]
+    assert rows[0]["archived"] is True
+    assert rows[0]["updatedAt"] == "2024-03-02T00:00:00.000Z"
+    assert offset == {"updatedAt": conn._init_ts}
+    assert any(query.get("archived") == ["true"] for query in seen_queries)

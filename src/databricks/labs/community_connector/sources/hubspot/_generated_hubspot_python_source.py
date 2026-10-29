@@ -1741,7 +1741,9 @@ def register_lakeflow_source(spark):
                 "cursor_field": "updatedAt",
                 "cursor_property_field": "hs_lastmodifieddate",
                 "associations": [],
-                "supports_deletes": False,  # Custom objects don't support archived queries by default
+                # Fallback only, for a table whose config was never resolved. Discovered
+                # custom objects opt into deletes explicitly in _discover_custom_objects.
+                "supports_deletes": False,
             }
 
             # {object}_property_history tables (see hubspot_property_history.py)
@@ -1858,7 +1860,15 @@ def register_lakeflow_source(spark):
                 names_by_type[object_type] = alias
 
             configs = {name: {**config, "associations": list(config["associations"])} for name, config in self._object_config.items()}
-            configs.update({name: {**self._default_object_config, "associations": []} for name in custom_types})
+            # Custom objects do support archived listing (verified live: the
+            # `archived=true` object listing returns records with `archived` and
+            # `archivedAt`, plus requested properties). Without a delete flow an
+            # archived custom record never leaves the destination and keeps looking
+            # active, so opt discovered custom objects into deletes.
+            configs.update({
+                name: {**self._default_object_config, "associations": [], "supports_deletes": True}
+                for name in custom_types
+            })
             reserved = {"id", "createdat", "updatedat", "archived", "properties"}
             # Resolve after collecting every type so custom/custom relationships do
             # not depend on schema order. Definitions are directional, not inferred.
