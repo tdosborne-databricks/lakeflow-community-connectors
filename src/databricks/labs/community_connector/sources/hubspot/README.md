@@ -106,6 +106,15 @@ deduplicated and sorted across pages and labels. Empty arrays mean a successful
 empty read. Missing parents are retried; incomplete responses or invalid cursors
 fail the read before it returns a new checkpoint.
 
+If a completed batch still reports only `OBJECT_NOT_FOUND` after those retries,
+the connector reconciles every unresolved parent through the documented
+single-record association GET API. Each read starts at page one and replaces
+earlier partial pages only after all GET pages succeed. A completely empty GET
+collection also requires a successful parent read with a matching active ID.
+Mixed errors, missing parents, malformed responses, and failed GETs still abort
+the read. These requests do not provide a transactional snapshot during source
+changes.
+
 The default incremental mode refreshes associations only for parents selected by
 their modification timestamp. HubSpot does not guarantee that association-only
 changes update that timestamp. Set `association_sync_mode=full_refresh` on an

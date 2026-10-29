@@ -672,10 +672,13 @@ def register_lakeflow_source(spark):
             base_url: str,
             post: Callable[[str, str, dict, float], dict],
             sleep: Callable[[float], None] = time.sleep,
+            *,
+            get: Callable[[str, str, dict, float], dict] | None = None,
         ) -> None:
             self.base_url = base_url.rstrip("/")
             self._post = post
             self._sleep = sleep
+            self._get = get
 
         def read(self, from_type: str, to_type: str, parent_ids: list[str]) -> dict[str, list[str]]:
             """Return sorted unique target IDs; retry omissions at their current cursor.
@@ -715,6 +718,16 @@ def register_lakeflow_source(spark):
                     for parent in list(pending):
                         if has_errors or data.get("status") != "COMPLETE" or parent not in results:
                             if retries[parent] >= ASSOCIATION_MAX_RETRIES:
+                                if self._get is not None and self._can_reconcile_not_found(data):
+                                    # GET and batch cursors are not interchangeable.
+                                    # Complete fresh reads before replacing any old pages.
+                                    reconciled = {
+                                        item: self._read_one(from_type, to_type, item)
+                                        for item in pending
+                                    }
+                                    targets.update(reconciled)
+                                    pending.clear()
+                                    break
                                 status = data.get("status")
                                 if not isinstance(status, str) or status not in {
                                     "COMPLETE", "PENDING", "PROCESSING", "CANCELED"
@@ -747,6 +760,59 @@ def register_lakeflow_source(spark):
                     if unresolved:
                         self._sleep(min(2.0 ** (max(unresolved) - 1), ASSOCIATION_MAX_BACKOFF_S))
             return {parent: sorted(ids) for parent, ids in targets.items()}
+
+        @staticmethod
+        def _can_reconcile_not_found(data: dict) -> bool:
+            errors = data.get("errors")
+            count = data.get("numErrors")
+            return (
+                data.get("status") == "COMPLETE"
+                and isinstance(data.get("results"), list)
+                and isinstance(errors, list) and bool(errors)
+                and type(count) is int and count == len(errors)
+                and all(isinstance(error, dict) and error.get("category") == "OBJECT_NOT_FOUND"
+                        for error in errors)
+            )
+
+        def _read_one(self, from_type: str, to_type: str, parent: str) -> set[str]:
+            base = f"{self.base_url}/crm/objects/2026-09/{quote(from_type, safe='')}/{quote(parent, safe='')}"
+            url = f"{base}/associations/{quote(to_type, safe='')}"
+            targets, seen = set(), set()
+            cursor = None
+            while True:
+                params = {"limit": 500, **({"after": cursor} if cursor is not None else {})}
+                data = self._get("associations", url, params, ASSOCIATION_MIN_INTERVAL_S)
+                if (not isinstance(data, dict) or not isinstance(data.get("results"), list)
+                        or any(key in data for key in ("errors", "numErrors", "category"))
+                        or data.get("status", "COMPLETE") != "COMPLETE"):
+                    raise RuntimeError("Malformed HubSpot association GET collection")
+                for result in data["results"]:
+                    if not isinstance(result, dict) or not isinstance(result.get("associationTypes"), list):
+                        raise RuntimeError("Malformed HubSpot association GET target")
+                    for kind in result["associationTypes"]:
+                        if (not isinstance(kind, dict) or type(kind.get("typeId")) is not int
+                                or kind["typeId"] < 0 or not isinstance(kind.get("category"), str)
+                                or kind["category"] not in {
+                                    "HUBSPOT_DEFINED", "INTEGRATOR_DEFINED", "USER_DEFINED", "WORK"
+                                }):
+                            raise RuntimeError("Malformed HubSpot association GET type")
+                    targets.add(_association_identifier(result.get("toObjectId"), "GET target ID"))
+                cursor = _association_next_cursor(data)
+                if cursor is None:
+                    break
+                if cursor in seen:
+                    raise RuntimeError("Repeated or cyclic HubSpot association GET cursor")
+                seen.add(cursor)
+            if not targets:
+                # An empty collection cannot establish that the parent still exists.
+                obj = self._get("associations", base, {"properties": "hs_object_id", "archived": "false"},
+                                ASSOCIATION_MIN_INTERVAL_S)
+                if (not isinstance(obj, dict) or obj.get("archived") is not False
+                        or any(key in obj for key in ("errors", "numErrors", "category"))
+                        or obj.get("status", "COMPLETE") != "COMPLETE"
+                        or _association_identifier(obj.get("id"), "GET parent ID") != parent):
+                    raise RuntimeError("Unproven HubSpot association GET parent identity")
+            return targets
 
         @staticmethod
         def _validate_results(data, pending: dict) -> dict:
@@ -1686,10 +1752,33 @@ def register_lakeflow_source(spark):
                 ],
                 get_api_object_type=self._get_api_object_type,
             )
-            self._associations = HubspotAssociations(self.base_url, self._history._post)
+            self._associations = HubspotAssociations(
+                self.base_url, self._history._post, get=self._get_association_page
+            )
             self._non_crm = HubspotNonCrm(
                 self.base_url, self.auth_header, self._custom_api_types, self._history._post
             )
+
+        def _get_association_page(self, kind, url, params, min_interval):
+            """Bounded GET transport without response bodies or record IDs in errors."""
+            for attempt in range(MAX_RETRIES + 1):
+                self._history._throttle(kind, min_interval)
+                try:
+                    response = requests.get(
+                        url, headers=self.auth_header, params=params, timeout=REQUEST_TIMEOUT_S
+                    )
+                except requests.RequestException:
+                    raise RuntimeError("HubSpot association GET request failed") from None
+                if response.status_code == 200:
+                    try:
+                        return response.json()
+                    except ValueError:
+                        raise RuntimeError("Malformed HubSpot association GET JSON") from None
+                if response.status_code == 429 and attempt < MAX_RETRIES:
+                    self._history._sleep(self._history._retry_delay(response, attempt))
+                    continue
+                raise RuntimeError(f"HubSpot association GET failed (status={response.status_code})")
+            raise RuntimeError("HubSpot association GET exhausted retries")
 
         def read_table_between_offsets(self, table_name, start_offset, end_offset, table_options):
             if is_history_table(table_name):

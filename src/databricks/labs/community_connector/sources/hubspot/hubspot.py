@@ -19,6 +19,8 @@ from databricks.labs.community_connector.sources.hubspot.hubspot_associations im
 from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import NON_CRM_TABLES, HubspotNonCrm
 from databricks.labs.community_connector.sources.hubspot.hubspot_property_history import (
     HISTORY_STANDARD_OBJECTS,
+    MAX_RETRIES,
+    REQUEST_TIMEOUT_S,
     HubspotPropertyHistory,
     filter_property_names,
     history_table_name,
@@ -150,10 +152,33 @@ class HubspotLakeflowConnect(LakeflowConnect):
             ],
             get_api_object_type=self._get_api_object_type,
         )
-        self._associations = HubspotAssociations(self.base_url, self._history._post)
+        self._associations = HubspotAssociations(
+            self.base_url, self._history._post, get=self._get_association_page
+        )
         self._non_crm = HubspotNonCrm(
             self.base_url, self.auth_header, self._custom_api_types, self._history._post
         )
+
+    def _get_association_page(self, kind, url, params, min_interval):
+        """Bounded GET transport without response bodies or record IDs in errors."""
+        for attempt in range(MAX_RETRIES + 1):
+            self._history._throttle(kind, min_interval)
+            try:
+                response = requests.get(
+                    url, headers=self.auth_header, params=params, timeout=REQUEST_TIMEOUT_S
+                )
+            except requests.RequestException:
+                raise RuntimeError("HubSpot association GET request failed") from None
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except ValueError:
+                    raise RuntimeError("Malformed HubSpot association GET JSON") from None
+            if response.status_code == 429 and attempt < MAX_RETRIES:
+                self._history._sleep(self._history._retry_delay(response, attempt))
+                continue
+            raise RuntimeError(f"HubSpot association GET failed (status={response.status_code})")
+        raise RuntimeError("HubSpot association GET exhausted retries")
 
     def read_table_between_offsets(self, table_name, start_offset, end_offset, table_options):
         if is_history_table(table_name):
