@@ -257,7 +257,7 @@ These are set directly under each `table` object in the pipeline spec:
 
 ### Common `table_configuration` options
 
-These are set inside the `table_configuration` map alongside any source-specific options:
+These control destination ingestion behavior in the `table_configuration` map:
 
 | Option | Required | Description |
 |---|---|---|
@@ -265,7 +265,29 @@ These are set inside the `table_configuration` map alongside any source-specific
 | `primary_keys` | No | List of columns to override the connector's default primary keys |
 | `sequence_by` | No | Column used to order records for SCD Type 2 change tracking |
 
-### Source-specific `table_configuration` options
+### Source-specific options
+
+For managed ingestion pipelines, put connector options under
+`connector_options.community_connector_options.options` on each source table.
+The managed Pipelines API can silently drop source options placed directly in
+`table_configuration`. Verify the persisted pipeline specification before the
+first update. For example:
+
+```yaml
+connection_name: your_hubspot_connection
+objects:
+  - table:
+      source_table: deals_property_history
+      destination_table: deals_property_history
+      connector_options:
+        community_connector_options:
+          options:
+            history_properties: "amount,dealstage"
+            max_records_per_batch: "60"
+```
+
+Include each external option in the UC connection's allowlist. The connector's
+Python interface still receives these values as its `table_options` map.
 
 | Option | Applies to | Default | Description |
 |---|---|---|---|
