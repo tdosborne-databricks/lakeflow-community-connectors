@@ -238,8 +238,8 @@ validation step.
 ### Common Schema Structure
 All objects follow the same base structure:
 - **Base Fields**: `id`, `createdAt`, `updatedAt`, `archived`
-- **Associations**: Arrays of associated object IDs (for standard objects)
-- **Properties**: All object properties flattened with `properties_` prefix
+- **Associations**: Directional ID arrays named for each target object, for standard and discovered custom objects
+- **Properties**: Selected object fields nested in the `properties` struct (for example, `properties.amount`)
 - **Dynamic Discovery**: Schema adapts automatically to your HubSpot configuration
 
 ## Table Configurations
