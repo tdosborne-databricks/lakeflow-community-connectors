@@ -203,6 +203,38 @@ pipeline recovery require live validation in the target account.
 - **Scopes**: the same `crm.objects.<object>.read` scope as the parent object.
 - **Known limitation**: changes that do not update the object's last-modified date (some calculated, rollup, or formula properties) are not detected until the object is next modified.
 
+### Activity coverage and schema migration
+
+Calls, emails, meetings, tasks, and notes use their current CRM object APIs.
+Discovered readable properties include bodies, email headers, attachment IDs,
+meeting notes and transcripts, and task fields when present in the portal.
+The connector preserves these property values; it does not download attachment
+content or reconstruct a legacy `engagements` table. AppDirect's consumed legacy
+fields still need to be compared with its export schema.
+
+All five activity families support archive reconciliation. Each delete read
+scans every archived page in a frozen archive-time window, irrespective of
+`max_records_per_batch`, because listing order does not guarantee archive-time
+order. Large archive inventories can therefore increase request volume and
+memory use. Only archives returned within HubSpot's retention are observable;
+hard deletes and expired archives are not guaranteed.
+
+**Breaking schema change:** CRM properties with HubSpot type `number` now map
+to `DECIMAL(38,18)` instead of `BIGINT`, preserving fractional values. This
+applies to every CRM object, including custom objects. Values may use at most
+20 integer digits and 18 fractional digits after removing trailing zeros.
+Invalid, nonfinite, or out-of-range values fail the read before checkpointing;
+they are not rounded or truncated. Property-history values remain strings and
+non-CRM resource schemas retain their explicit types.
+
+For an existing pipeline, inspect downstream numeric casts and plan a destination
+schema migration before upgrading. Validate a separate destination and fresh
+checkpoint first; follow the pipeline's supported schema-change or full-refresh
+procedure for the production cutover. Do not assume existing BIGINT columns or
+checkpoints migrate automatically. Local source/generated consumer tests cover
+exact decimals; managed runtime and Delta serialization remain a required live
+validation step.
+
 ### Common Schema Structure
 All objects follow the same base structure:
 - **Base Fields**: `id`, `createdAt`, `updatedAt`, `archived`

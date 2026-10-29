@@ -7,7 +7,7 @@
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import (
     Any,
     Callable,
@@ -1525,6 +1525,7 @@ def register_lakeflow_source(spark):
             }
             # Cache for discovered schemas to avoid repeated API calls
             self._schema_cache = {}
+            self._property_types = {}
             # Cache for table metadata
             self._metadata_cache = {}
             self._custom_objects = None
@@ -1543,7 +1544,7 @@ def register_lakeflow_source(spark):
             )
 
             # Centralized object metadata configuration
-            # supports_deletes: HubSpot only supports archived/deleted queries for core CRM objects
+            # Archive listing is documented for core objects and all five activities.
             self._object_config = {
                 "contacts": {
                     "primary_keys": ["id"],
@@ -1578,7 +1579,7 @@ def register_lakeflow_source(spark):
                     "cursor_field": "updatedAt",
                     "cursor_property_field": "hs_lastmodifieddate",
                     "associations": ["contacts", "companies", "deals", "tickets"],
-                    "supports_deletes": False,  # HubSpot doesn't support archived queries for calls
+                    "supports_deletes": True,
                 },
                 "emails": {
                     "primary_keys": ["id"],
@@ -1592,7 +1593,7 @@ def register_lakeflow_source(spark):
                     "cursor_field": "updatedAt",
                     "cursor_property_field": "hs_lastmodifieddate",
                     "associations": ["contacts", "companies", "deals", "tickets"],
-                    "supports_deletes": False,  # HubSpot doesn't support archived queries for meetings
+                    "supports_deletes": True,
                 },
                 "tasks": {
                     "primary_keys": ["id"],
@@ -1979,7 +1980,11 @@ def register_lakeflow_source(spark):
                         f"{resp.status_code} {resp.text}"
                     )
 
-                return resp.json()["results"]
+                properties = resp.json()["results"]
+                self._property_types[object_type] = {
+                    prop["name"]: str(prop.get("type", "string")).lower() for prop in properties
+                }
+                return properties
             except Exception as e:
                 # Re-raise (don't return an error dict): callers iterate this as a
                 # list of property dicts, so a dict here turns a real API error into
@@ -1991,13 +1996,13 @@ def register_lakeflow_source(spark):
         def _map_hubspot_type_to_spark(self, hubspot_type: str) -> DataType:
             """
             Map HubSpot property types to Spark DataTypes
-            Following the requirement: strings -> StringType, integers -> LongType
+            HubSpot number properties can contain fractions; preserve exact decimals.
             """
             type_mapping = {
                 "string": StringType(),
                 "enumeration": StringType(),
                 "bool": BooleanType(),  # Keep boolean as boolean for better data handling
-                "number": LongType(),
+                "number": DecimalType(38, 18),
                 "date": StringType(),  # Store as string to preserve ISO format
                 "date-time": StringType(),  # Store as string to preserve ISO format
                 "datetime": StringType(),
@@ -2049,101 +2054,70 @@ def register_lakeflow_source(spark):
                 table_options=table_options,
             )
 
-        def read_table_deletes(
-            self, table_name: str, start_offset: dict, table_options: Dict[str, str]
-        ) -> (Iterator[dict], dict):
+        @staticmethod
+        def _archive_time(value):
+            if not isinstance(value, str):
+                raise RuntimeError("Malformed HubSpot archive timestamp")
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise RuntimeError("Malformed HubSpot archive timestamp") from exc
+            if parsed.tzinfo is None:
+                raise RuntimeError("Malformed HubSpot archive timestamp timezone")
+            return parsed.astimezone(timezone.utc)
+
+        def read_table_deletes(self, table_name, start_offset, table_options):
+            """Reconcile all archived pages in a frozen window before checkpointing.
+
+            Object listing is not ordered by archivedAt. Admission cannot truncate
+            this scan without skipping older archive times on later pages.
             """
-            Read deleted (archived) records from HubSpot API.
-
-            HubSpot uses "archived" status to represent deleted records. This method
-            fetches all archived records and filters them client-side for incremental reads.
-
-            Internally uses archivedAt for filtering, but copies it to updatedAt in the
-            output records and offset for consistency with the normal read flow cursor.
-
-            Args:
-                table_name: Name of the table to read deleted records from
-                start_offset: Dictionary containing cursor information for incremental reads
-                             (uses 'updatedAt' key, which stores archivedAt values)
-                table_options: Additional options for reading
-
-            Returns:
-                Tuple of (deleted_records, new_offset) where updatedAt contains archivedAt value
-            """
-            if table_name in NON_CRM_TABLES:
-                return iter([]), start_offset or {}
-            supported_tables = self.list_tables()
-            if table_name not in supported_tables:
-                raise ValueError(
-                    f"Unsupported table: {table_name}. "
-                    f"Supported tables are: {supported_tables}"
-                )
-
-            # Short-circuit once the cursor has caught up to the init-time cap,
-            # so Trigger.AvailableNow can terminate.
-            if (
-                start_offset
-                and start_offset.get("updatedAt", "") >= self._init_ts
-            ):
-                return [], start_offset
-
-            # Get discovered properties (no associations needed for deletes)
-            metadata = self.read_table_metadata(table_name, table_options)
-            property_names = metadata.get("property_names", [])
-
-            max_records = self._parse_max_records(table_options)
-
-            all_records = []
+            start = start_offset or {}
+            if table_name in NON_CRM_TABLES or is_history_table(table_name):
+                return iter([]), start
+            if table_name not in self.list_tables():
+                raise ValueError(f"Unsupported table: {table_name}")
+            if not self._get_object_config(table_name).get("supports_deletes", False):
+                return iter([]), start
+            upper = self._archive_time(self._init_ts)
+            checkpoint = self._archive_time(start["updatedAt"]) if "updatedAt" in start else None
+            if checkpoint is not None and checkpoint >= upper:
+                return iter([]), start
+            properties = self.read_table_metadata(table_name, table_options).get("property_names", [])
+            rows, seen_ids, seen_cursors = [], {}, set()
             after = None
-            # Use updatedAt from offset (which stores archivedAt values for delete flow)
-            checkpoint = start_offset.get("updatedAt") if start_offset else None
-            latest_archived = checkpoint
-
             while True:
-                # Fetch archived records using the Objects API with archived=true
-                records, after = self._fetch_full_refresh_batch(
-                    table_name, property_names, associations=[], after=after, archived=True
+                records, next_after = self._fetch_full_refresh_batch(
+                    table_name, properties, associations=[], after=after, archived=True
                 )
-
-                if not records:
+                if not records and next_after is not None:
+                    raise RuntimeError("Empty HubSpot archive page has pagination")
+                for record in records:
+                    if not isinstance(record, dict) or record.get("archived") is not True:
+                        raise RuntimeError("Malformed HubSpot archive record")
+                    raw_id = record.get("id")
+                    if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+                        raise RuntimeError("Malformed HubSpot archive identity")
+                    identity = str(raw_id)
+                    archived = self._archive_time(record.get("archivedAt"))
+                    if identity in seen_ids:
+                        if seen_ids[identity] != record:
+                            raise RuntimeError("Conflicting duplicate HubSpot archive identity")
+                        continue
+                    seen_ids[identity] = record
+                    if archived > upper or (checkpoint is not None and archived <= checkpoint):
+                        continue
+                    row = self._transform_single_record({**record, "id": identity}, table_name, properties)
+                    row["updatedAt"] = archived.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                    rows.append(row)
+                if next_after is None:
                     break
-
-                # Filter client-side for incremental deletes based on archivedAt (from raw records)
-                if checkpoint:
-                    records = [r for r in records if r.get("archivedAt", "") > checkpoint]
-
-                # Transform records
-                transformed_records = self._transform_records(records, table_name)
-
-                # Copy archivedAt to updatedAt for consistency with normal flow cursor
-                for i, transformed in enumerate(transformed_records):
-                    archived_at = records[i].get("archivedAt")
-                    if archived_at:
-                        transformed["updatedAt"] = archived_at
-                        if not latest_archived or archived_at > latest_archived:
-                            latest_archived = archived_at
-
-                all_records.extend(transformed_records)
-
-                if not after:
-                    break
-
-                # Stop if we've hit the per-microbatch record cap. The next
-                # microbatch resumes from latest_archived via the cursor filter.
-                if max_records is not None and len(all_records) >= max_records:
-                    break
-
-                # Rate limiting
+                if str(next_after) in seen_cursors:
+                    raise RuntimeError("HubSpot archive pagination cursor repeated")
+                seen_cursors.add(str(next_after))
+                after = next_after
                 time.sleep(0.1)
-
-            # Cap the returned cursor at the init-time bound so the next call
-            # eventually short-circuits.
-            if latest_archived and latest_archived > self._init_ts:
-                latest_archived = self._init_ts
-
-            # Return offset with updatedAt key for consistency with normal flow
-            offset = {"updatedAt": latest_archived} if latest_archived else {}
-            return all_records, offset
+            return iter(rows), {"updatedAt": self._init_ts}
 
         def _read_data(
             self, table_name: str, start_offset: dict = None, incremental: bool = False,
@@ -2226,7 +2200,7 @@ def register_lakeflow_source(spark):
                 # relationships. Hydrate every selected parent before publishing it.
                 self._hydrate_associations(table_name, records, associations)
                 # Transform records
-                transformed_records = self._transform_records(records, table_name)
+                transformed_records = self._transform_records(records, table_name, property_names)
                 all_records.extend(transformed_records)
 
                 # Update latest timestamp
@@ -2288,8 +2262,20 @@ def register_lakeflow_source(spark):
                 )
 
             data = resp.json()
-            records = data.get("results", [])
-            next_after = data.get("paging", {}).get("next", {}).get("after")
+            if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+                raise RuntimeError("Malformed HubSpot object results")
+            records = data["results"]
+            paging = data.get("paging", {})
+            if not isinstance(paging, dict):
+                raise RuntimeError("Malformed HubSpot object pagination")
+            next_after = None
+            if "next" in paging:
+                nxt = paging["next"]
+                if not isinstance(nxt, dict) or "after" not in nxt:
+                    raise RuntimeError("Malformed HubSpot object pagination cursor")
+                next_after = nxt["after"]
+                if isinstance(next_after, bool) or not isinstance(next_after, (str, int)) or not str(next_after):
+                    raise RuntimeError("Malformed HubSpot object pagination cursor")
 
             return records, next_after
 
@@ -2357,11 +2343,11 @@ def register_lakeflow_source(spark):
 
             return records, next_after, latest_in_batch
 
-        def _transform_records(self, records: List[Dict], table_name: str) -> List[Dict]:
+        def _transform_records(self, records: List[Dict], table_name: str, property_names=None) -> List[Dict]:
             """Transform HubSpot records by flattening properties and associations"""
-            return [self._transform_single_record(record, table_name) for record in records]
+            return [self._transform_single_record(record, table_name, property_names) for record in records]
 
-        def _transform_single_record(self, record: Dict, table_name: str) -> Dict:
+        def _transform_single_record(self, record: Dict, table_name: str, property_names=None) -> Dict:
             """Transform a single HubSpot record"""
             transformed_record = {}
 
@@ -2373,22 +2359,47 @@ def register_lakeflow_source(spark):
             # Copy properties with empty string to None conversion
             # HubSpot API returns "" for null values in many fields
             if "properties" in record:
-                transformed_record["properties"] = self._sanitize_properties(record["properties"])
+                transformed_record["properties"] = self._sanitize_properties(record["properties"], table_name, property_names)
 
             # Handle associations
             transformed_record.update(self._extract_associations(record, table_name))
 
             return transformed_record
 
-        def _sanitize_properties(self, properties: Dict) -> Dict:
-            """Convert empty strings to None in properties dict.
+        @staticmethod
+        def _decimal_property(value):
+            """Reject values which Spark decimal(38,18) would round or overflow."""
+            try:
+                number = Decimal(str(value))
+            except InvalidOperation as exc:
+                raise ValueError("Invalid HubSpot numeric property") from exc
+            if not number.is_finite():
+                raise ValueError("Nonfinite HubSpot numeric property")
+            if number == 0:
+                return Decimal(0)
+            sign, digits, exponent = number.as_tuple()
+            digits = list(digits)
+            while digits[-1] == 0:
+                digits.pop()
+                exponent += 1
+            if max(-exponent, 0) > 18 or max(len(digits) + exponent, 0) > 20:
+                raise ValueError("HubSpot numeric property exceeds decimal(38,18)")
+            return Decimal((sign, tuple(digits), exponent))
 
-            HubSpot API returns empty strings "" instead of null for many fields,
-            which causes issues when parsing to typed schemas (e.g., LongType).
-            """
+        def _sanitize_properties(self, properties: Dict, table_name: str = None, property_names=None) -> Dict:
+            """Normalize HubSpot nulls and preserve representable numeric values."""
             if not properties:
                 return properties
-            return {k: (None if v == "" else v) for k, v in properties.items()}
+            types = self._property_types.get(table_name, {})
+            output = {}
+            for name, value in properties.items():
+                if value == "" or value is None:
+                    output[name] = None
+                elif types.get(name) == "number" and (property_names is None or name in property_names):
+                    output[name] = self._decimal_property(value)
+                else:
+                    output[name] = value
+            return output
 
         def _extract_associations(self, record: Dict, table_name: str) -> Dict:
             """Extract association IDs from record"""
