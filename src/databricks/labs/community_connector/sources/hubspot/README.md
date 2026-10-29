@@ -221,12 +221,27 @@ The connector preserves these property values; it does not download attachment
 content or reconstruct a legacy `engagements` table. AppDirect's consumed legacy
 fields still need to be compared with its export schema.
 
-All five activity families support archive reconciliation. Each delete read
+Calls, emails, tasks, and notes use archive reconciliation. Each delete read
 scans every archived page in a frozen archive-time window, irrespective of
 `max_records_per_batch`, because listing order does not guarantee archive-time
 order. Large archive inventories can therefore increase request volume and
 memory use. Only archives returned within HubSpot's retention are observable;
 hard deletes and expired archives are not guaranteed.
+
+Meetings use complete active snapshots by default. HubSpot rejects archived
+meeting listing with `VALIDATION_ERROR` for `MEETING_EVENT` (`0-47`). Each read
+therefore enumerates the complete current meeting set, even with a saved offset
+or record cap. The snapshot consumer reconciles missing IDs after a successful
+complete read; there is no `meetings_delete` flow. This preserves current-state
+removals without archive timestamps or deleted-meeting history. Meeting reads
+remain snapshots when `association_sync_mode=incremental` is supplied.
+
+Active snapshots reject empty pages with continuation, repeated cursors,
+malformed records, and duplicate IDs before returning any rows or offset. A
+successful empty snapshot represents an empty current set. Pagination is not a
+transactional source snapshot: concurrent source changes can still affect what
+a complete enumeration observes. Snapshot reconciliation and mixed-object
+option isolation require validation through the managed consumer.
 
 **Breaking schema change:** CRM properties with HubSpot type `number` now map
 to `DECIMAL(38,18)` instead of `BIGINT`, preserving fractional values. This
