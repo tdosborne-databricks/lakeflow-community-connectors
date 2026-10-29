@@ -362,3 +362,45 @@ Follow the Lakeflow Community Connector UI, which will guide you through setting
 
 **Error Handling:**
 The connector includes built-in error handling for common scenarios like rate limiting, network issues, and API errors. Check the pipeline logs for detailed error information and recommended actions.
+
+
+### Managed per-table option isolation
+
+The CLI repeats one `tableConfigs` JSON string on every explicit HubSpot table.
+It maps source table names to their complete connector option dictionaries. This
+preserves table-specific filters when native planning shares flat options across
+objects. For example:
+
+```json
+{"calls":{"include_properties":"hs_call_body"},"notes":{}}
+```
+
+With an envelope present, the selected entry is authoritative: `{}` means default
+options, and omitted keys never inherit another table's flat options. Missing
+entries, duplicate JSON keys, invalid shapes, and undeclared options fail with
+sanitized errors. Table names and property names retain their exact spelling.
+Only the envelope key accepts case-insensitive spelling for Spark options.
+Connection credentials and framework routing options cannot appear inside entries.
+`tableConfigs` is a framework connection allowlist option, not a nested HubSpot
+option; existing connections must allow it as well as the desired HubSpot options.
+
+The connector validates and retains a constructor envelope before virtual metadata
+parses it. This instance-scoped map remains authoritative when adapters extract
+an entry. A conflicting replacement map requires a new source instance. Without
+a constructor envelope, legacy flat options remain supported and individual SPI
+calls can supply their own complete maps. Resolution covers schema, metadata,
+reads, deletes, and replay, including history and non-CRM dispatch.
+
+CLI automatic normalization identifies HubSpot by explicit source name or an
+exact `lakeflow_community_connectors_hubspot` wheel filename in the final pipeline
+dependencies. Renamed/custom packages need explicit HubSpot identification. It
+supports explicit tables in the absent/default source schema; schema/report
+selectors are rejected because the CLI cannot enumerate their complete map
+locally. Other connectors retain their existing behavior.
+
+Local tests do not establish native managed transport: verify that the envelope
+and correct table identity reach both planning and execution. The current generic
+ingestion-agent dispatcher also loses case-insensitive routing when copying Spark
+options: a lowercased `tablename` is rejected as missing `tableName`. Direct agent
+calls with canonical routing keys and lowercased `tableconfigs` are covered; this
+connector change does not fix generic agent routing.

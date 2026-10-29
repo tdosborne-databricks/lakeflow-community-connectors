@@ -14,6 +14,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -1636,6 +1637,10 @@ def register_lakeflow_source(spark):
         }
 
         def __init__(self, options: dict) -> None:
+            # Validate before the framework's virtual metadata decoder can parse or
+            # log raw JSON. Retain an instance-scoped snapshot when adapters extract
+            # entries (including .get(table, {}) for a missing table).
+            self._table_configs = self._parse_table_configs(options)
             self.access_token = options["access_token"]
             self.base_url = "https://api.hubapi.com"
             self.auth_header = {
@@ -1781,6 +1786,7 @@ def register_lakeflow_source(spark):
             raise RuntimeError("HubSpot association GET exhausted retries")
 
         def read_table_between_offsets(self, table_name, start_offset, end_offset, table_options):
+            table_options = self._resolve_table_options(table_name, table_options)
             if is_history_table(table_name):
                 return self._history.read_between_offsets(
                     table_name, start_offset, end_offset, table_options
@@ -1890,6 +1896,74 @@ def register_lakeflow_source(spark):
             """Get configuration for a specific object type"""
             return self._object_config.get(table_name, self._custom_object_configs.get(table_name, self._default_object_config))
 
+        # Keep in sync with connector_spec.yaml; envelopes cannot smuggle connection
+        # credentials or framework routing keys through the external option allowlist.
+        _TABLE_OPTION_KEYS = frozenset({
+            "max_records_per_batch", "history_properties", "history_since",
+            "history_lookback_minutes", "include_properties", "exclude_properties",
+            "association_sync_mode", "pipeline_object_types",
+        })
+
+        @classmethod
+        def _parse_table_configs(cls, table_options: Mapping[str, str] | None) -> dict | None:
+            """Validate every envelope entry without logging user-supplied values."""
+            options = dict(table_options or {})
+            # Spark's CaseInsensitiveDict iterates lowercased keys. Its dict copy
+            # loses case-insensitive lookup, so recognize the envelope explicitly.
+            envelope_keys = [key for key in options if isinstance(key, str)
+                             and key.lower() == "tableconfigs"]
+            if not envelope_keys:
+                return None
+            if len(envelope_keys) != 1:
+                raise ValueError("HubSpot tableConfigs contains conflicting option keys")
+
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("HubSpot tableConfigs contains duplicate keys")
+                    result[key] = value
+                return result
+
+            raw = options[envelope_keys[0]]
+            if not isinstance(raw, str):
+                raise ValueError("HubSpot tableConfigs must be a JSON object string")
+            try:
+                configs = json.loads(raw, object_pairs_hook=unique_object)
+            except (ValueError, TypeError, RecursionError):
+                raise ValueError("HubSpot tableConfigs is invalid JSON or has duplicate keys") from None
+            if not isinstance(configs, dict):
+                raise ValueError("HubSpot tableConfigs must contain an object")
+            for name, config in configs.items():
+                if not isinstance(name, str) or not name or name.strip() != name:
+                    raise ValueError("HubSpot tableConfigs has an invalid table name")
+                if not isinstance(config, dict) or any(
+                    key not in cls._TABLE_OPTION_KEYS or not isinstance(value, str)
+                    for key, value in config.items()
+                ):
+                    raise ValueError("HubSpot tableConfigs has invalid table options")
+            return configs
+
+        def _resolve_table_options(
+            self, table_name: str, table_options: Mapping[str, str] | None
+        ) -> dict[str, str]:
+            """Use the constructor snapshot or supplied complete map, never a merge.
+
+            A constructor envelope belongs to this source instance for its lifetime.
+            Conflicting supplied maps require a new source instance. Legacy instances
+            without an envelope can resolve different maps on successive SPI calls.
+            """
+            configs = self._parse_table_configs(table_options)
+            if self._table_configs is not None:
+                if configs is not None and configs != self._table_configs:
+                    raise ValueError("HubSpot tableConfigs conflicts with the constructor map")
+                configs = self._table_configs
+            if configs is None:
+                return dict(table_options or {})
+            if table_name not in configs:
+                raise ValueError("HubSpot tableConfigs is missing the requested table")
+            return dict(configs[table_name])
+
         @staticmethod
         def _association_sync_mode(table_options: Dict[str, str] | None) -> str:
             mode = (table_options or {}).get("association_sync_mode", "incremental")
@@ -1909,6 +1983,7 @@ def register_lakeflow_source(spark):
             Returns:
                 A StructType object representing the schema of the table.
             """
+            table_options = self._resolve_table_options(table_name, table_options)
             if table_name in NON_CRM_TABLES:
                 return self._non_crm.get_table_schema(table_name)
             supported_tables = self.list_tables()
@@ -1969,6 +2044,7 @@ def register_lakeflow_source(spark):
                         - "cdc": capture incremental changes
                         - "append": incremental append
             """
+            table_options = self._resolve_table_options(table_name, table_options)
             if table_name in NON_CRM_TABLES:
                 return self._non_crm.read_table_metadata(table_name)
             supported_tables = self.list_tables()
@@ -2175,6 +2251,7 @@ def register_lakeflow_source(spark):
             Returns:
                 Tuple of (records, new_offset)
             """
+            table_options = self._resolve_table_options(table_name, table_options)
             if table_name in NON_CRM_TABLES:
                 return iter(self._non_crm.read_table(table_name, table_options)), {}
             supported_tables = self.list_tables()
@@ -2220,6 +2297,7 @@ def register_lakeflow_source(spark):
             Object listing is not ordered by archivedAt. Admission cannot truncate
             this scan without skipping older archive times on later pages.
             """
+            table_options = self._resolve_table_options(table_name, table_options)
             start = start_offset or {}
             if table_name in NON_CRM_TABLES or is_history_table(table_name):
                 return iter([]), start
