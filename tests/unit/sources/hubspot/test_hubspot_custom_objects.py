@@ -106,7 +106,7 @@ def test_properties_discovery_uses_versioned_wrapper_for_standard_objects(genera
 @pytest.mark.parametrize("generated", [False, True])
 def test_wide_object_filters_properties_before_building_snapshot_request(generated):
     """A 1,200-property schema must not leak into the filtered request URL."""
-    names = [f"appdirect_custom_property_{i:04d}" for i in range(1200)]
+    names = [f"wide_custom_property_{i:04d}" for i in range(1200)]
     properties = [{"name": name, "type": "string"} for name in names]
     selected = names[1]
     expected = {selected, "hs_lastmodifieddate"}

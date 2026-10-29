@@ -218,8 +218,9 @@ Calls, emails, meetings, tasks, and notes use their current CRM object APIs.
 Discovered readable properties include bodies, email headers, attachment IDs,
 meeting notes and transcripts, and task fields when present in the portal.
 The connector preserves these property values; it does not download attachment
-content or reconstruct a legacy `engagements` table. AppDirect's consumed legacy
-fields still need to be compared with its export schema.
+content or reconstruct a legacy `engagements` table. A consumer that still reads
+the older engagement export shape should compare its consumed legacy fields
+against these tables before switching.
 
 Calls, emails, tasks, and notes use archive reconciliation. Each delete read
 scans every archived page in a frozen archive-time window, irrespective of

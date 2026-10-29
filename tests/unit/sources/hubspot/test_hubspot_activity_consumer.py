@@ -34,8 +34,8 @@ FIELDS = {
 class ActivityAPI:
     def __init__(self, table, number="42.125"):
         self.table = table
-        self.properties = {**FIELDS[table], "appdirect_decimal_metric": number,
-                           "appdirect_boolean": "false", "appdirect_future_field": "preserve me",
+        self.properties = {**FIELDS[table], "extra_decimal_metric": number,
+                           "extra_boolean": "false", "extra_future_field": "preserve me",
                            "hs_lastmodifieddate": STAMP}
         self.requests = []
 
@@ -45,8 +45,8 @@ class ActivityAPI:
             payload = {"results": []}
         elif "/crm/properties/2026-09/" in url:
             payload = {"results": [{"name": name, "type": (
-                "number" if name in {"appdirect_decimal_metric", "hs_call_duration"} else
-                "bool" if name == "appdirect_boolean" else "string"
+                "number" if name in {"extra_decimal_metric", "hs_call_duration"} else
+                "bool" if name == "extra_boolean" else "string"
             )} for name in self.properties]}
         else:
             assert urlparse(url).path == f"/crm/objects/2026-09/{self.table}"
@@ -100,9 +100,9 @@ def test_nonempty_activity_fields_survive_reader(table, incremental, generated):
     assert len(rows) == 1 and end != start
     _make_type_verifier(schema)(rows[0])
     properties = rows[0].properties.asDict()
-    assert properties["appdirect_decimal_metric"] == Decimal("42.125")
-    assert properties["appdirect_boolean"] is False
-    assert properties["appdirect_future_field"] == "preserve me"
+    assert properties["extra_decimal_metric"] == Decimal("42.125")
+    assert properties["extra_boolean"] is False
+    assert properties["extra_future_field"] == "preserve me"
     for field, value in FIELDS[table].items():
         assert properties[field] == (Decimal(value) if field == "hs_call_duration" else value)
     if incremental and table != "meetings":
@@ -138,7 +138,7 @@ def test_maximum_decimal_is_exact_at_consumer(generated):
         rows, _ = stream.read({})
         row = list(rows)[0]
     _make_type_verifier(schema)(row)
-    assert row.properties.appdirect_decimal_metric == Decimal(value)
+    assert row.properties.extra_decimal_metric == Decimal(value)
 
 
 @pytest.mark.parametrize("generated", [False, True])
@@ -147,5 +147,5 @@ def test_excluded_invalid_number_does_not_fail_read(generated):
     with patch("requests.get", side_effect=api.get), patch("requests.post", side_effect=api.post):
         conn, _, _ = consumer("meetings", generated)
         rows, end = conn.read_table("meetings", {}, {
-            "exclude_properties": "appdirect_decimal_metric"})
+            "exclude_properties": "extra_decimal_metric"})
         assert len(list(rows)) == 1 and end
