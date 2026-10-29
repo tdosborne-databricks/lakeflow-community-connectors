@@ -448,6 +448,17 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
                 "propertiesWithHistory": properties,
             }
             data = self._post("batch", url, body, BATCH_MIN_INTERVAL_S)
+            if not isinstance(data, dict) or not isinstance(data.get("results", []), list):
+                raise RuntimeError("Malformed HubSpot history batch results")
+            status = data.get("status")
+            if status not in ("COMPLETE", "PENDING", "PROCESSING", "CANCELED"):
+                raise RuntimeError("Malformed HubSpot history batch status")
+            # A parent identity in a processing/canceled payload does not prove
+            # that its property history is complete. Retry without committing it.
+            if status != "COMPLETE":
+                if attempt < MAX_RETRIES:
+                    self._sleep(min(2.0 ** attempt, MAX_BACKOFF_S))
+                continue
             for result in data.get("results", []) or []:
                 object_id = str(result.get("id")) if isinstance(result, dict) else None
                 if object_id not in pending:

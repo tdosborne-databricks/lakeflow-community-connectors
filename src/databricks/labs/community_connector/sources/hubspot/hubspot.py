@@ -15,6 +15,7 @@ from pyspark.sql.types import (
 
 from databricks.labs.community_connector.interface import LakeflowConnect
 from databricks.labs.community_connector.sources.hubspot.hubspot_associations import HubspotAssociations
+from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import NON_CRM_TABLES, HubspotNonCrm
 from databricks.labs.community_connector.sources.hubspot.hubspot_property_history import (
     HISTORY_STANDARD_OBJECTS,
     HubspotPropertyHistory,
@@ -148,6 +149,13 @@ class HubspotLakeflowConnect(LakeflowConnect):
             get_api_object_type=self._get_api_object_type,
         )
         self._associations = HubspotAssociations(self.base_url, self._history._post)
+        self._non_crm = HubspotNonCrm(
+            self.base_url, self.auth_header, self._custom_api_types, self._history._post
+        )
+
+    def _custom_api_types(self) -> List[str]:
+        self._discover_custom_objects(require_access=True)
+        return list(self._custom_object_types.values())
 
     def list_tables(self) -> list[str]:
         """
@@ -174,9 +182,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
         history_tables = [
             history_table_name(obj) for obj in HISTORY_STANDARD_OBJECTS + custom_objects
         ]
-        return standard_tables + history_tables
+        return standard_tables + history_tables + self._non_crm.list_tables()
 
-    def _discover_custom_objects(self) -> List[str]:
+    def _discover_custom_objects(self, require_access: bool = False) -> List[str]:
         """
         Discover custom objects from HubSpot CRM schemas API
         """
@@ -186,7 +194,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         resp = requests.get(url, headers=self.auth_header, timeout=60)
         # Schema access is optional for accounts ingesting only standard CRM
         # objects. Do not cache a denied response as successful empty discovery.
-        if resp.status_code == 403:
+        if resp.status_code == 403 and not require_access:
             return []
         if resp.status_code != 200:
             raise RuntimeError(f"HubSpot schema discovery failed: HTTP {resp.status_code}")
@@ -204,7 +212,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             if not isinstance(object_type, str) or not object_type.startswith("2-") or not isinstance(name, str) or not name:
                 raise RuntimeError("HubSpot custom schema requires name and objectTypeId")
             alias = name.lower()
-            if alias in self._object_config or alias in custom_types or object_type in names_by_type or is_history_table(alias):
+            if alias in self._object_config or alias in NON_CRM_TABLES or alias in custom_types or object_type in names_by_type or is_history_table(alias):
                 raise RuntimeError("HubSpot custom schema has a conflicting identity")
             custom_types[alias] = object_type
             names_by_type[object_type] = alias
@@ -267,6 +275,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
         Returns:
             A StructType object representing the schema of the table.
         """
+        if table_name in NON_CRM_TABLES:
+            return self._non_crm.get_table_schema(table_name)
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
@@ -325,6 +335,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     - "cdc": capture incremental changes
                     - "append": incremental append
         """
+        if table_name in NON_CRM_TABLES:
+            return self._non_crm.read_table_metadata(table_name)
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
@@ -347,14 +359,15 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         return metadata
 
-    @staticmethod
-    def _options_cache_key(table_name: str, table_options: Dict[str, str] | None) -> tuple:
+    @classmethod
+    def _options_cache_key(cls, table_name: str, table_options: Dict[str, str] | None) -> tuple:
         """Cache key covering the options that change schema/metadata output."""
         opts = table_options or {}
         return (
             table_name,
             opts.get("include_properties"),
             opts.get("exclude_properties"),
+            cls._association_sync_mode(opts),
         )
 
     def _discover_table_schema(self, table_name: str, table_options: Dict[str, str]) -> StructType:
@@ -518,6 +531,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
         Returns:
             Tuple of (records, new_offset)
         """
+        if table_name in NON_CRM_TABLES:
+            return iter(self._non_crm.read_table(table_name, table_options)), {}
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
@@ -564,6 +579,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
         Returns:
             Tuple of (deleted_records, new_offset) where updatedAt contains archivedAt value
         """
+        if table_name in NON_CRM_TABLES:
+            return iter([]), start_offset or {}
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(

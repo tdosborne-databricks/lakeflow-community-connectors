@@ -61,6 +61,37 @@ The HubSpot connector supports the following CRM objects with dynamic schema dis
 
 > **Note**: Table names are case-sensitive. Use the exact names shown above (lowercase with underscores). Custom objects are also supported and will be discovered automatically, each with a matching `<custom_object>_property_history` table.
 
+### Resource snapshots
+
+The following tables use complete snapshot ingestion. Each read drains every
+configured partition and page before returning rows. An HTTP error, malformed
+page, incomplete partition discovery, or conflicting duplicate fails the read.
+The downstream snapshot consumer reconciles removals after a successful read.
+These tables retain all source fields in a JSON `payload` column alongside typed
+common fields. They do not use `max_records_per_batch` or property filters.
+
+| Table | Primary key | Coverage |
+|---|---|---|
+| `owners` | `id` | Active and archived owners, including teams |
+| `pipelines` | `objectTypeId`, `id` | Pipelines and nested stages for configured object types |
+| `forms` | `id` | Active and archived forms |
+| `contact_lists` | `listId` | Contact lists with MANUAL, DYNAMIC, or SNAPSHOT processing type |
+| `contact_list_memberships` | `listId`, `recordId` | Current memberships of each discovered contact list |
+| `form_submissions` | `formId`, `conversionId` | Submissions for each discovered form |
+
+Private apps need `crm.objects.owners.read` for owners, `forms` for forms and
+submissions, and an appropriate list read scope (`crm.segments.read` or
+`crm.lists.read`) for contact lists and memberships. Pipeline access also depends
+on the object permissions and subscription. Missing permission fails a selected
+snapshot; it is not interpreted as an empty table.
+
+By default, pipeline snapshots enumerate deals (`0-3`), tickets (`0-5`), tasks
+(`0-27`), and discovered custom objects. Schema discovery must succeed for that
+inventory to be complete. Use `pipeline_object_types` to supply a comma-separated
+explicit set, such as `0-3,0-5`; that set replaces discovery. Add this option to an
+existing Unity Catalog connection's external options allowlist before using it.
+Every selected partition must be readable; inaccessible partitions are not skipped.
+
 ### Custom objects and associations
 
 Custom table names remain the lowercase schema names; API calls use their
@@ -205,9 +236,10 @@ These are set inside the `table_configuration` map alongside any source-specific
 |---|---|---|---|
 | `max_records_per_batch` | all incremental tables | no cap | Soft limit on records returned per microbatch. Object and property-history reads drain parents sharing the last processed `updatedAt`, including across search pages, before stopping. A timestamp group can exceed this value by more than one batch. |
 | `association_sync_mode` | object tables | `incremental` | `incremental` refreshes selected changed parents. `full_refresh` uses snapshot ingestion and reconciles all current relationships on every update. Add this option to an existing UC connection's external options allowlist before using it. |
+| `pipeline_object_types` | `pipelines` | deals, tickets, tasks, discovered custom types | Comma-separated canonical object type IDs. Replaces the default partition inventory; each configured partition must succeed. |
 | `history_properties` | `*_property_history` | all properties | Comma-separated property names to fetch history for (e.g. `lifecyclestage,hs_lead_status,dealstage`). Recommended for portals with many properties, because requesting history for every property makes each Batch Read response larger. |
-| `include_properties` | all tables | all properties | Comma-separated allowlist of properties to ingest. If set, only these discovered properties are read and exposed in the schema (unknown names are ignored, matching HubSpot's behavior). Required for objects with very many properties — full refresh fails with HTTP 414 once the request URL passes ~22,000 characters (objects with 1,000+ properties always exceed this). The object's cursor property is always retained. |
-| `exclude_properties` | all tables | none | Comma-separated list of properties to drop from ingestion. Applied after `include_properties`. |
+| `include_properties` | CRM object and history tables | all properties | Comma-separated allowlist of properties to ingest. If set, only these discovered properties are read and exposed in the schema (unknown names are ignored, matching HubSpot's behavior). Required for objects with very many properties — full refresh fails with HTTP 414 once the request URL passes ~22,000 characters (objects with 1,000+ properties always exceed this). The object's cursor property is always retained. |
+| `exclude_properties` | CRM object and history tables | none | Comma-separated list of properties to drop from ingestion. Applied after `include_properties`. |
 | `history_since` | `*_property_history` | none | ISO-8601 timestamp (e.g. `2025-01-01T00:00:00Z`). Only objects modified on or after this time are read, and older history entries are dropped. Caps the initial backfill. |
 | `history_lookback_minutes` | `*_property_history` | `10` | Minutes subtracted from the saved cursor for the first search in a pipeline update. The current strict watermark filter still drops parents at or below the cursor, so this does not yet recover late-indexed parents. Set to `0` to disable. |
 

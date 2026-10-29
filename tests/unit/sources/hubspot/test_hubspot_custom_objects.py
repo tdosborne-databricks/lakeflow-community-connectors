@@ -65,7 +65,7 @@ def test_custom_object_id_used_for_properties_snapshot_incremental_and_history(g
         if path == "/crm/objects/2026-09/2-12345/search":
             return _Response({"results": [parent]})
         assert path == "/crm/objects/2026-09/2-12345/batch/read"
-        return _Response({"results": [{
+        return _Response({"status": "COMPLETE", "results": [{
             "id": "1",
             "propertiesWithHistory": {"vin": [{"value": "example-vin", "timestamp": stamp}]},
         }]})
@@ -335,3 +335,57 @@ def test_full_refresh_mode_reconciles_association_removal_without_parent_update(
         assert list(second)[0]["garages"] == []
         assert offset == next_offset == {"updatedAt": stamp}
     assert associations.call_args_list == [mock.call("2-100", "2-200", ["1"])] * 2
+
+
+@pytest.mark.parametrize("generated", [False, True])
+@pytest.mark.parametrize("first_snapshot", [False, True])
+def test_metadata_cache_respects_association_sync_mode(generated, first_snapshot):
+    conn = _connector_class(generated)({"access_token": "test-only-token"})
+    snapshot = {"association_sync_mode": "full_refresh"}
+    order = [snapshot, {}] if first_snapshot else [{}, snapshot]
+    with mock.patch("requests.get", return_value=_Response({"results": []})):
+        for options in order + order:
+            expected = "snapshot" if options else "cdc_with_deletes"
+            assert conn.read_table_metadata("deals", options)["ingestion_type"] == expected
+
+
+@pytest.mark.parametrize("generated", [False, True])
+@pytest.mark.parametrize("status", ["PENDING", "PROCESSING", "CANCELED"])
+def test_noncomplete_history_batch_never_returns_a_checkpoint(generated, status):
+    conn = _connector_class(generated)({"access_token": "test-only-token"})
+    history = conn._history
+    history._sleep = lambda _: None
+    history._get_property_names = lambda _: ["email"]
+    stamp = "2024-03-01T00:00:00.000Z"
+    start = {"updatedAt": "2023-01-01T00:00:00.000Z"}
+    with mock.patch.object(history, "_search_changed", return_value=([
+        {"id": "1", "updatedAt": stamp},
+    ], None)), mock.patch.object(history, "_post", return_value={
+        "status": status, "results": [{"id": "1", "propertiesWithHistory": {
+            "email": [{"timestamp": stamp, "value": "example"}],
+        }}],
+    }):
+        with pytest.raises(RuntimeError, match="incomplete"):
+            history.read_table("contacts_property_history", start, {})
+    assert start == {"updatedAt": "2023-01-01T00:00:00.000Z"}
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_pipeline_snapshot_requires_complete_partition_discovery(generated):
+    conn = _connector_class(generated)({"access_token": "offline"})
+    conn._non_crm._sleep = lambda _: None
+
+    def get(url, **_kwargs):
+        if url.endswith("/schemas"):
+            return mock.Mock(status_code=403)
+        assert "/crm/pipelines/2026-09/" in url
+        return _Response({"results": [{"id": "p", "stages": []}]})
+
+    with mock.patch("requests.get", side_effect=get):
+        with pytest.raises(RuntimeError, match="schema discovery.*403"):
+            conn.read_table("pipelines", None, {})
+        rows, offset = conn.read_table(
+            "pipelines", None, {"pipeline_object_types": "0-3"}
+        )
+        assert [r["objectTypeId"] for r in rows] == ["0-3"]
+        assert offset == {}

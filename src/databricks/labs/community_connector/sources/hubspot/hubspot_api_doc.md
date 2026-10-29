@@ -1,6 +1,6 @@
 # HubSpot API — Connector Reference
 
-This document maps each connector table to its underlying HubSpot CRM v3 API
+This document maps each connector table to its underlying HubSpot API
 endpoint(s), pagination strategy, and rate-limit behavior. The implementation
 lives in `hubspot.py`; tables and authentication are documented in `README.md`.
 
@@ -24,14 +24,14 @@ https://api.hubapi.com
 
 ## Rate Limits
 
-- 100 requests per 10 seconds per token (default).
-- 250,000 requests per day per token (free / starter; varies by plan).
-- 429 responses include a `Retry-After` header — the connector respects this
-  via exponential backoff.
+HubSpot limits vary by endpoint family, subscription, and private-app entitlement.
+Search has its own limits and a 10,000-result query window. The connector uses
+bounded retries for HTTP429 and separate request pacing. Do not treat configured
+pacing as a guaranteed account-wide budget when multiple pipelines share a token.
 
 ## Pagination
 
-HubSpot CRM v3 paginates with an opaque `paging.next.after` cursor. The
+HubSpot paginates with an opaque `paging.next.after` cursor. The
 connector follows it until either:
 1. The endpoint returns no `paging.next.after`, or
 2. The configured `max_records_per_batch` (admission control) is reached, in
@@ -225,3 +225,23 @@ requests (Airbyte-style) is a possible follow-up.
 - Search limits: https://developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm#limits
 - Batch read (contacts example, same shape for all CRM objects): https://developers.hubspot.com/docs/api-reference/legacy/crm/objects/contacts/batch/get-contacts
 - Usage guidelines (current limits table): https://developers.hubspot.com/docs/developer-tooling/platform/usage-guidelines
+
+## Resource snapshot endpoints
+
+| Table | Endpoint | Pagination |
+|---|---|---|
+| `owners` | `GET /crm/owners/2026-09` | `paging.next.after`, active and archived partitions |
+| `pipelines` | `GET /crm/pipelines/2026-09/{objectTypeId}` | `paging.next.after`, every configured object partition |
+| `forms` | `GET /marketing/v3/forms` | `paging.next.after`, active and archived partitions, `formTypes=all` |
+| `contact_lists` | `POST /crm/lists/2026-09/all` | `paging.next.after` passed as `after` in the next request body |
+| `contact_list_memberships` | `GET /crm/lists/2026-09/{listId}/memberships` | `paging.next.after` for each discovered contact list |
+| `form_submissions` | `GET /form-integrations/v1/submissions/forms/{formId}` | `paging.next.after` for each discovered form |
+
+Forms intentionally use the supported marketing v3 and submissions v1 endpoints.
+The `2027-03-beta` Forms API is Beta and is not selected by this connector.
+Lists are restricted to contact object type `0-1`; a list still processing fails
+membership publication. All resource tables are full snapshots with no saved
+incremental cursor. Failed pages or partitions abort publication of that snapshot.
+Implementation: `hubspot_non_crm.py`. See README for keys, scopes, and pipeline
+partition selection. Current live validation may require additional account scopes
+and fixtures; offline fixtures alone do not establish production completeness.

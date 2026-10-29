@@ -205,7 +205,7 @@ class _FakeHubspot:
         results = [
             _history_result(i["id"], by_id[i["id"]]["updatedAt"]) for i in json["inputs"]
         ]
-        return _Resp(200, {"results": results})
+        return _Resp(200, {"status": "COMPLETE", "results": results})
 
 
 def test_429_retries_with_retry_after():
@@ -244,8 +244,8 @@ def test_partial_history_batch_recovers_missing_parent_without_duplicates(status
     reader = _reader()
     stamp = "2024-03-01T00:00:00.000Z"
     responses = [
-        _Resp(status, {"results": [_history_result(2, stamp)]}),
-        _Resp(200, {"results": [_history_result(1, stamp)]}),
+        _Resp(status, {"status": "COMPLETE", "results": [_history_result(2, stamp)]}),
+        _Resp(200, {"status": "COMPLETE", "results": [_history_result(1, stamp)]}),
     ]
     with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
         rows = reader._batch_read_history("deals", ["1", "2"], ["email"])
@@ -262,9 +262,9 @@ def test_unresolved_history_batch_does_not_checkpoint_past_missing_parent(monkey
     stamp = "2024-03-01T00:00:00.000Z"
     responses = [
         _Resp(200, {"results": [_parent(1, stamp), _parent(2, stamp)]}),
-        _Resp(207, {"results": [_history_result(1, stamp)]}),
-        _Resp(207, {"results": []}),
-        _Resp(207, {"results": []}),
+        _Resp(207, {"status": "COMPLETE", "results": [_history_result(1, stamp)]}),
+        _Resp(207, {"status": "COMPLETE", "results": []}),
+        _Resp(207, {"status": "COMPLETE", "results": []}),
     ]
     with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
         with pytest.raises(RuntimeError, match="incomplete.*1.*2"):
@@ -276,8 +276,28 @@ def test_unresolved_history_batch_does_not_checkpoint_past_missing_parent(monkey
 @pytest.mark.parametrize("results", [[{"id": "unrequested"}], [{}], [None]])
 def test_history_batch_rejects_invalid_result_identity(results):
     reader = _reader()
-    with mock.patch.object(hph.requests, "post", return_value=_Resp(200, {"results": results})):
+    with mock.patch.object(hph.requests, "post", return_value=_Resp(200, {"status": "COMPLETE", "results": results})):
         with pytest.raises(RuntimeError, match="unexpected.*identity"):
+            reader._batch_read_history("deals", ["1"], ["email"])
+
+
+def test_history_retries_processing_result_before_committing_it():
+    reader = _reader()
+    partial = _history_result("1", "2024-03-01T00:00:00.000Z")
+    complete = _history_result("1", "2024-03-02T00:00:00.000Z")
+    with mock.patch.object(reader, "_post", side_effect=[
+        {"status": "PROCESSING", "results": [partial]},
+        {"status": "COMPLETE", "results": [complete]},
+    ]) as post:
+        assert reader._batch_read_history("deals", ["1"], ["email"]) == [complete]
+    assert post.call_count == 2
+
+
+@pytest.mark.parametrize("status", [None, "UNKNOWN"])
+def test_history_rejects_missing_or_unknown_batch_status(status):
+    reader = _reader()
+    with mock.patch.object(reader, "_post", return_value={"status": status, "results": []}):
+        with pytest.raises(RuntimeError, match="batch status"):
             reader._batch_read_history("deals", ["1"], ["email"])
 
 
