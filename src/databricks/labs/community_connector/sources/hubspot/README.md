@@ -189,14 +189,17 @@ Property-history tables retain their own ingestion strategy.
 - **Cursor Field**: `timestamp`
 - **Schema**: `object_id`, `property`, `value`, `timestamp`, `source_type`, `source_id`, `source_label`, `updated_by_user_id`
 - **How it reads**: the Search API finds objects whose last-modified date changed since the last run (Search does not return history), then the Batch Read API (`POST /crm/objects/2026-09/{object}/batch/read`) fetches `propertiesWithHistory` for those objects, up to 50 IDs per call.
-- **Rate limiting**: Search calls are spaced to stay under HubSpot's 5 requests/second Search limit, and HTTP 429 responses are retried (honouring `Retry-After`, otherwise exponential backoff, up to 5 retries). Before paging past the Search API's 10,000-result cap, the connector returns only timestamp groups proven complete by observing a later timestamp. The final group is reread next time. If no complete new group fits in the search window, the read fails without advancing its checkpoint.
-- **Partial history responses**: The connector reconciles returned parent IDs against every requested batch, including HTTP 200 and 207 responses. It retries only missing IDs, up to 5 times. If any remain unresolved, the read fails before returning a new checkpoint. This also applies to records deleted between search and batch read; the connector does not silently discard their missing history.
+- **Pagination and checkpoints**: Search sorts by numeric `hs_object_id` within a frozen modification-time window. Every page starts a new query with `hs_object_id GT <last hydrated ID>`, avoiding Search's 10,000-result paging window. Checkpoints retain the scan bounds, last ID, completion flag, parent count, and rolling parent-ID digest. Legacy `updatedAt` checkpoints remain readable. Admission can stop after a complete batch of parents, even within a timestamp group.
+- **Replay**: A new scan includes the configured lookback before the saved watermark. All selected parents' requested history is emitted, including entries older than that watermark, except where `history_since` explicitly excludes them. CDC keys deduplicate repeated history entries. Failed-batch recovery honors the recorded ending frontier and ignores admission limits. If Search membership changes during recovery, its parent count/digest check fails before returning rows.
+- **Rate limiting**: Search calls are paced below HubSpot's Search limit. HTTP429 responses use bounded retries, honoring `Retry-After` or exponential backoff.
+- **Partial history responses**: Batch results must have status `COMPLETE`. Missing requested parent IDs are retried, including HTTP200/207 partial responses; unresolved parents fail the read before returning a checkpoint. Records deleted between Search and Batch Read are not silently discarded.
 
-Known completeness limits remain: the current timestamp-only checkpoint cannot
-recover late-indexed parents at or below its watermark, despite the lookback
-search window. A timestamp group that fills the Search API's result window
-blocks ingestion until a different pagination strategy is available; it is not
-silently skipped. Neither case is resolved by the partial-response retry.
+Lookback provides bounded recovery: indexing delays longer than the configured
+window can still miss a parent. Search excludes archived objects. The selection
+window freezes parent modification times, but Batch Read returns current history,
+not a historical snapshot as of that upper bound. Numeric-ID ordering and managed
+pipeline recovery require live validation in the target account.
+
 - **Scopes**: the same `crm.objects.<object>.read` scope as the parent object.
 - **Known limitation**: changes that do not update the object's last-modified date (some calculated, rollup, or formula properties) are not detected until the object is next modified.
 
@@ -234,14 +237,14 @@ These are set inside the `table_configuration` map alongside any source-specific
 
 | Option | Applies to | Default | Description |
 |---|---|---|---|
-| `max_records_per_batch` | all incremental tables | no cap | Soft limit on records returned per microbatch. Object and property-history reads drain parents sharing the last processed `updatedAt`, including across search pages, before stopping. A timestamp group can exceed this value by more than one batch. |
+| `max_records_per_batch` | all incremental tables | no cap | Soft limit on records returned per microbatch. History stops after complete parent batches and saves an ID frontier; one parent can exceed the cap. Object reads drain parents sharing the last processed `updatedAt` before stopping. |
 | `association_sync_mode` | object tables | `incremental` | `incremental` refreshes selected changed parents. `full_refresh` uses snapshot ingestion and reconciles all current relationships on every update. Add this option to an existing UC connection's external options allowlist before using it. |
 | `pipeline_object_types` | `pipelines` | deals, tickets, tasks, discovered custom types | Comma-separated canonical object type IDs. Replaces the default partition inventory; each configured partition must succeed. |
 | `history_properties` | `*_property_history` | all properties | Comma-separated property names to fetch history for (e.g. `lifecyclestage,hs_lead_status,dealstage`). Recommended for portals with many properties, because requesting history for every property makes each Batch Read response larger. |
 | `include_properties` | CRM object and history tables | all properties | Comma-separated allowlist of properties to ingest. If set, only these discovered properties are read and exposed in the schema (unknown names are ignored, matching HubSpot's behavior). Required for objects with very many properties — full refresh fails with HTTP 414 once the request URL passes ~22,000 characters (objects with 1,000+ properties always exceed this). The object's cursor property is always retained. |
 | `exclude_properties` | CRM object and history tables | none | Comma-separated list of properties to drop from ingestion. Applied after `include_properties`. |
 | `history_since` | `*_property_history` | none | ISO-8601 timestamp (e.g. `2025-01-01T00:00:00Z`). Only objects modified on or after this time are read, and older history entries are dropped. Caps the initial backfill. |
-| `history_lookback_minutes` | `*_property_history` | `10` | Minutes subtracted from the saved cursor for the first search in a pipeline update. The current strict watermark filter still drops parents at or below the cursor, so this does not yet recover late-indexed parents. Set to `0` to disable. |
+| `history_lookback_minutes` | `*_property_history` | `10` | Minutes subtracted from the saved watermark when starting a new history scan. Replays late-indexed parents within this window, including their older history entries. A resumed scan retains its original lower bound. Set to `0` to disable the time lookback. |
 
 `include_properties` / `exclude_properties` also apply to `*_property_history` tables (they bound which properties are requested in `propertiesWithHistory`; `history_properties` still narrows further for history reads). Two operational notes:
 

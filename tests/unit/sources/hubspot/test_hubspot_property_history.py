@@ -71,10 +71,8 @@ def test_history_initial_read_flattens_entries(connector):
         for entries in r["propertiesWithHistory"].values()
     )
     assert len(rows) == expected
-    base_corpus = json.loads((SPEC_DIR / "corpus" / "contacts.json").read_text())
-    # The offset tracks the max updatedAt of the parent objects found via
-    # search, which is served from the base object corpus in simulate mode.
-    assert offset == {"updatedAt": max(r["updatedAt"] for r in base_corpus)}
+    assert offset["updatedAt"] == connector._history._init_ts
+    assert offset["history_scan"]["complete"] is True
     assert rows
     for r in rows:
         assert set(r) == {
@@ -187,14 +185,19 @@ class _FakeHubspot:
         assert timeout
         if url.endswith("/search"):
             self.search_bodies.append(json)
-            lo = None
-            for f in (json.get("filterGroups") or [{}])[0].get("filters", []):
-                if f["operator"] == "GTE":
-                    lo = int(f["value"])
-            matching = [
-                p for p in self.parents
-                if lo is None or hph._to_ms(hph._parse_ts(p["updatedAt"])) >= lo  # pylint: disable=protected-access
-            ]
+            filters = (json.get("filterGroups") or [{}])[0].get("filters", [])
+            def matches(parent):
+                for field in filters:
+                    actual = int(parent["id"]) if field["propertyName"] == "hs_object_id" else hph._to_ms(hph._parse_ts(parent["updatedAt"]))
+                    value = int(field["value"])
+                    if field["operator"] == "GTE" and actual < value:
+                        return False
+                    if field["operator"] == "GT" and actual <= value:
+                        return False
+                    if field["operator"] == "LTE" and actual > value:
+                        return False
+                return True
+            matching = sorted((p for p in self.parents if matches(p)), key=lambda parent: int(parent["id"]))
             start = int(json.get("after") or 0)
             page = matching[start : start + self.page_size]
             nxt = start + len(page)
@@ -218,7 +221,8 @@ def test_429_retries_with_retry_after():
     ]
     with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
         rows, offset = reader.read_table("contacts_property_history", {}, {})
-    assert list(rows) == [] and offset == {}
+    assert list(rows) == [] and offset["updatedAt"] == reader._init_ts
+    assert offset["history_scan"]["complete"] is True
     assert post.call_count == 3
     assert 2.0 in sleeps  # honoured Retry-After
     assert 2.0 ** 1 in sleeps  # exponential fallback on 2nd attempt
@@ -301,25 +305,19 @@ def test_history_rejects_missing_or_unknown_batch_status(status):
             reader._batch_read_history("deals", ["1"], ["email"])
 
 
-def test_lookback_applied_once_per_trigger():
+def test_lookback_is_persisted_and_replayable_after_restart():
     fake = _FakeHubspot([_parent(1, "2024-03-01T00:00:00.000Z")])
-    reader = _reader()
     start = {"updatedAt": "2024-03-01T00:00:00.000Z"}
     opts = {"history_lookback_minutes": "60"}
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
-        reader.read_table("contacts_property_history", start, opts)
-        reader.read_table("contacts_property_history", start, opts)
-
-    def gte(body):
+        for _ in range(2):
+            rows, offset = _reader().read_table("contacts_property_history", start, opts)
+            assert {row["object_id"] for row in rows} == {"1"}
+            assert offset != start
+    watermark_ms = hph._to_ms(hph._parse_ts(start["updatedAt"]))
+    for body in fake.search_bodies:
         filters = body["filterGroups"][0]["filters"]
-        return next(f for f in filters if f["operator"] == "GTE")["value"]
-
-    watermark_ms = hph._to_ms(hph._parse_ts(start["updatedAt"]))  # pylint: disable=protected-access
-    assert int(gte(fake.search_bodies[0])) == watermark_ms - 60 * 60 * 1000
-    assert int(gte(fake.search_bodies[1])) == watermark_ms
-    # Upper bound is always the connector's init time.
-    lte = [f for f in fake.search_bodies[0]["filterGroups"][0]["filters"] if f["operator"] == "LTE"]
-    assert lte and int(lte[0]["value"]) == hph._to_ms(hph._parse_ts("2030-01-01T00:00:00.000Z"))  # pylint: disable=protected-access
+        assert int(next(f["value"] for f in filters if f["operator"] == "GTE")) == watermark_ms - 3600000
 
 
 def test_max_records_per_batch_and_convergence():
@@ -343,7 +341,8 @@ def test_max_records_per_batch_and_convergence():
             offset = new_offset
             assert calls < 20
     assert seen == {str(i) for i in range(200)}
-    assert offset == {"updatedAt": "2024-03-04T00:00:00.000Z"}
+    assert offset["updatedAt"] == reader._init_ts
+    assert offset["history_scan"]["complete"] is True
     assert all(len(b["inputs"]) <= hph.BATCH_READ_SIZE for b in fake.batch_bodies)
 
 
@@ -359,76 +358,55 @@ def test_batch_cap_does_not_split_equal_timestamp_parents(page_size):
         remaining, final_offset = reader.read_table("contacts_property_history", offset, opts)
         seen.update(row["object_id"] for row in remaining)
     assert seen == {str(i) for i in range(150)}
-    assert final_offset == offset == {"updatedAt": stamp}
+    assert final_offset["updatedAt"] == reader._init_ts
+    assert final_offset["history_scan"]["complete"] is True
+    assert final_offset != offset
 
 
 def test_search_result_cap_reanchors(monkeypatch):
-    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
     parents = [_parent(i, f"2024-03-01T00:00:{i:02d}.000Z") for i in range(25)]
-    fake = _FakeHubspot(parents, page_size=4)
-    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
-    reader = _reader()
-    opts = {"history_lookback_minutes": "0"}
-    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
-        rows, offset = reader.read_table("contacts_property_history", {}, opts)
-        rows = list(rows)
-        seen = {r["object_id"] for r in rows}
-        final_offset = offset
-        for _ in range(10):
-            remaining, next_offset = reader.read_table(
-                "contacts_property_history", final_offset, opts
-            )
-            seen.update(r["object_id"] for r in remaining)
-            if next_offset == final_offset:
-                break
-            final_offset = next_offset
-    # Stopped before paging past the cap and checkpointed the last updatedAt.
-    assert max(int(b.get("after") or 0) for b in fake.search_bodies) + 4 <= 10
-    assert offset == {"updatedAt": parents[len(rows) - 1]["updatedAt"]}
-    assert seen == {str(i) for i in range(25)}
-    assert final_offset == {"updatedAt": parents[-1]["updatedAt"]}
-
-
-def test_search_cap_does_not_checkpoint_partial_timestamp_group(monkeypatch):
-    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
-    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
-    early = "2024-03-01T00:00:00.000Z"
-    tied = "2024-03-01T00:01:00.000Z"
-    parents = [_parent(0, early)] + [_parent(i, tied) for i in range(1, 9)]
     fake = _FakeHubspot(parents, page_size=4)
     reader = _reader()
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
         rows, offset = reader.read_table("contacts_property_history", {}, {})
-        seen = {r["object_id"] for r in rows}
-        assert offset == {"updatedAt": early}
-        assert seen == {"0"}
+        assert [r["object_id"] for r in rows] == [str(i) for i in range(25)]
+    assert all("after" not in body for body in fake.search_bodies)
+    assert offset["updatedAt"] == reader._init_ts
+    assert offset["history_scan"]["after_id"] == "24"
 
 
-def test_search_cap_fails_closed_when_no_complete_timestamp_group(monkeypatch):
-    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+def test_keyset_scan_completes_groups_across_query_windows(monkeypatch):
     monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
-    stamp = "2024-03-01T00:00:00.000Z"
-    fake = _FakeHubspot([_parent(i, stamp) for i in range(11)], page_size=4)
-    reader = _reader()
+    parents = [_parent(0, "2024-03-01T00:00:00.000Z")] + [
+        _parent(i, "2024-03-01T00:01:00.000Z") for i in range(1, 9)]
+    fake = _FakeHubspot(parents, page_size=4)
+    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
+        rows, offset = _reader().read_table("contacts_property_history", {}, {})
+        assert {r["object_id"] for r in rows} == {str(i) for i in range(9)}
+    assert offset["history_scan"]["complete"] is True
+
+
+def test_keyset_scan_completes_one_huge_timestamp_group(monkeypatch):
+    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
+    fake = _FakeHubspot([_parent(i, "2024-03-01T00:00:00.000Z") for i in range(11)], page_size=4)
     checkpoint = {}
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
-        with pytest.raises(RuntimeError, match="search result limit"):
-            reader.read_table("contacts_property_history", checkpoint, {})
-    assert checkpoint == {}
+        rows, offset = _reader().read_table("contacts_property_history", checkpoint, {})
+        assert {r["object_id"] for r in rows} == {str(i) for i in range(11)}
+    assert checkpoint == {} and offset["history_scan"]["complete"] is True
 
 
-def test_search_cap_counts_parents_discarded_by_watermark(monkeypatch):
-    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+def test_keyset_scan_replays_boundary_parents_without_query_paging(monkeypatch):
     monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
     stamp = "2024-03-01T00:00:00.000Z"
     fake = _FakeHubspot([_parent(i, stamp) for i in range(11)], page_size=4)
-    reader = _reader()
     checkpoint = {"updatedAt": stamp}
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
-        with pytest.raises(RuntimeError, match="search result limit"):
-            reader.read_table("contacts_property_history", checkpoint, {})
-    assert checkpoint == {"updatedAt": stamp}
-    assert max(int(b.get("after") or 0) for b in fake.search_bodies) + 4 <= 10
+        rows, offset = _reader().read_table("contacts_property_history", checkpoint, {})
+        assert {r["object_id"] for r in rows} == {str(i) for i in range(11)}
+    assert checkpoint == {"updatedAt": stamp} and offset != checkpoint
+    assert all("after" not in body for body in fake.search_bodies)
 
 
 def test_base_tables_offset_advance_contract(connector):
@@ -456,33 +434,21 @@ def test_short_circuit_at_init_time():
 
 
 def test_history_offset_advance_contract():
-    """A non-empty batch must advance the offset past its start.
-
-    The GTE-inclusive search re-returns the parent that set the watermark;
-    those rows must be dropped so the batch is empty when nothing new exists,
-    and the offset must strictly advance whenever rows are emitted.
-    """
-    parents = [
-        _parent(1, "2024-03-01T00:00:00.000Z"),
-        _parent(2, "2024-03-02T00:00:00.000Z"),
-    ]
+    parents = [_parent(1, "2024-03-01T00:00:00.000Z"), _parent(2, "2024-03-02T00:00:00.000Z")]
     fake = _FakeHubspot(parents)
     reader = _reader()
+    reader._init_ts = "2024-03-02T00:00:00.000Z"
+    reader._init_dt = hph._parse_ts(reader._init_ts)
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
         rows, offset = reader.read_table("contacts_property_history", {}, {})
         assert len(list(rows)) == 2
-        assert offset == {"updatedAt": "2024-03-02T00:00:00.000Z"}
-
-        # Resume from the watermark: only the boundary parent comes back; it
-        # must be dropped, giving an EMPTY batch with the same offset.
+        assert offset["updatedAt"] == reader._init_ts
         rows, offset2 = reader.read_table("contacts_property_history", offset, {})
-        assert list(rows) == []
-        assert offset2 == offset
-
-        # A new update (parent 2 moves forward): rows emitted AND offset advances.
+        assert list(rows) == [] and offset2 == offset
         parents[1]["updatedAt"] = "2024-03-03T00:00:00.000Z"
-        rows, offset3 = reader.read_table("contacts_property_history", offset, {})
-        rows = list(rows)
-        assert rows and all(r["object_id"] == "2" for r in rows)
-        assert offset3 == {"updatedAt": "2024-03-03T00:00:00.000Z"}
-        assert offset3 != offset
+        restarted = _reader()
+        restarted._init_ts = "2024-03-04T00:00:00.000Z"
+        restarted._init_dt = hph._parse_ts(restarted._init_ts)
+        rows, offset3 = restarted.read_table("contacts_property_history", offset, {})
+        assert {r["object_id"] for r in rows} == {"2"}
+        assert offset3["updatedAt"] == restarted._init_ts and offset3 != offset

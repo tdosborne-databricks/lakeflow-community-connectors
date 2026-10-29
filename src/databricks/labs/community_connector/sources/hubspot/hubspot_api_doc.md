@@ -145,31 +145,35 @@ Each history entry (`ValueWithTimestamp`) has `value`, `timestamp`,
 
 ### Read pattern
 
-1. `POST /crm/objects/2026-09/{type}/search` with `GTE <cursor - lookback>` and
-   `LTE <init_ts>` on the cursor property, ascending, `limit: 200`, returning
-   only IDs and `updatedAt`.
-2. `POST /crm/objects/2026-09/{type}/batch/read` with up to 50 IDs and
-   `propertiesWithHistory` (all properties from the Properties API, or the
-   `history_properties` table option).
-3. One output row per history entry; entries older than the query's lower
-   bound (or `history_since`) are dropped.
+1. Search a frozen parent modification-time range, sorted by numeric
+   `hs_object_id` ascending. Subsequent pages use `hs_object_id GT <last ID>` in
+   a fresh query, rather than increasing the request's paging `after`.
+2. Batch Read up to 50 parent IDs with `propertiesWithHistory`. Reconcile every
+   requested parent and require status `COMPLETE` before advancing the frontier.
+3. Emit each selected parent's history; only explicit `history_since` filters
+   history-entry timestamps. Parent selection bounds do not truncate old entries.
 
-Offset: `{"updatedAt": <max parent updatedAt processed>}`. The lookback is
-applied once per connector instance (one pipeline update), not stored in the
-offset.
+Offsets retain `history_scan` version 1, lower/upper bounds, last fully hydrated
+`after_id`, `complete`, and cumulative `parent_count`/`parent_digest`. `updatedAt` advances to the frozen upper bound only
+when that scan completes. A completed scan returns no rows when read again in
+that trigger. A new trigger opens a fresh lookback window. Legacy timestamp-only
+offsets remain readable. Recovery uses the persisted ending bounds/frontier and
+ignores normal admission limits, and verifies the recorded parent membership
+before returning any rows, through the framework's optional
+`read_table_between_offsets` hook.
 
 ### Limits that shape the implementation
 
 - Search: **5 requests/second per account**, max 200 results per page, max
   **10,000 results per query** (paging past it returns 400). The reader spaces
-  search calls 250 ms apart and ends a read before the cap, re-anchoring the
-  next search at the latest `updatedAt`.
+  search calls 250 ms apart and reanchors each query at the last numeric parent
+  ID. A timestamp group can span arbitrarily many bounded queries.
 - General burst limits for privately distributed apps: 100 requests / 10 s
   (Free/Starter), 190 / 10 s (Professional/Enterprise), 250 / 10 s with the API
   limit increase. Daily: 250k / 625k / 1M per account.
 - 429 responses: retried up to 5 times, honouring `Retry-After` when present,
   else exponential backoff (1, 2, 4, 8, 16 s; capped at 30 s). Retry applies to
-  the property history tables only.
+  history reads; other endpoint families have their own retry behavior.
 
 ### Known gaps (to confirm in live testing)
 
@@ -181,7 +185,7 @@ offset.
 
 ## Property filtering (`include_properties` / `exclude_properties`)
 
-By default every table discovers and requests **all** properties. Two table
+By default CRM object and history tables discover and request **all** properties. Two table
 options bound that set (both are applied to object tables and to
 `*_property_history` tables):
 

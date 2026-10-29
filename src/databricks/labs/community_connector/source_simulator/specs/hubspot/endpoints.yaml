@@ -101,43 +101,34 @@ endpoints:
     corpus: notes
     response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}}}}
 
-  # Search endpoint (POST) — used for incremental reads. Same wrapper.
+  # Search models time/ID filters, ordering, and bounded paging.
   - path: /crm/objects/2026-09/contacts/search
     method: POST
-    corpus: contacts
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/companies/search
     method: POST
-    corpus: companies
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/deals/search
     method: POST
-    corpus: deals
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/tickets/search
     method: POST
-    corpus: tickets
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/calls/search
     method: POST
-    corpus: calls
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/emails/search
     method: POST
-    corpus: emails
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/meetings/search
     method: POST
-    corpus: meetings
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/tasks/search
     method: POST
-    corpus: tasks
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
   - path: /crm/objects/2026-09/notes/search
     method: POST
-    corpus: notes
-    response: {pagination_style: none, wrapper: {records_key: results, extras: {paging: {}, total: 0}}}
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
 
   # Batch read (POST) — used by the {object}_property_history tables to fetch
   # propertiesWithHistory for the IDs found via search. Inputs live in the

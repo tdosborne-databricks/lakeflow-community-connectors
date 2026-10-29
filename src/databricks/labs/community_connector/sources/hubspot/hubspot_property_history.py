@@ -3,24 +3,20 @@
 One row per entry in HubSpot's ``propertiesWithHistory`` response, i.e.
 one row per (object, property, change timestamp).
 
-Read flow for one ``read_table`` call:
+Reads select changed parents with a frozen last-modified time window, sorted
+by numeric hs_object_id. Each page is a new query reanchored after the last
+fully hydrated parent, avoiding the10,000-result paging window. In-progress
+and completed JSON offsets retain the scan bounds and ID frontier so process
+restarts and readBetweenOffsets replay the recorded range.
 
-1. **Find changed parents** via ``POST /crm/objects/2026-09/{type}/search``
-   filtered on the object's last-modified property, sorted ascending,
-   bounded above by the connector's init time. Search does *not* accept
-   ``propertiesWithHistory``, so it only returns IDs + ``updatedAt``.
-2. **Fetch history** for those IDs via
-   ``POST /crm/objects/2026-09/{type}/batch/read`` with ``propertiesWithHistory``
-   in the JSON body (no URL-length limit, unlike the list endpoint).
-3. **Emit** one row per history entry whose timestamp is at or after the
-   query's lower bound (and ``history_since``, if set).
-
-The offset is ``{"updatedAt": <max parent updatedAt processed>}``. Tables
-are ``cdc`` keyed on ``(object_id, property, timestamp)`` so re-reads from
-the lookback window or the inclusive (GTE) boundary are de-duplicated by
-the pipeline's merge.
+History entries are filtered only by explicit history_since. Lookback replays
+parents through CDC upserts keyed by (object_id, property, timestamp), including
+older entries for late-indexed parents. Indexing delays outside the configured
+lookback and archived parents are not recovered by Search. Batch history is a
+current API read, not a point-in-time snapshot at the frozen selection bound.
 """
 
+import hashlib
 import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
@@ -63,7 +59,6 @@ DEFAULT_LOOKBACK_MINUTES = 10
 # HubSpot limits, see
 # https://developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm#limits
 SEARCH_PAGE_SIZE = 200  # max objects per search page
-SEARCH_RESULT_CAP = 10_000  # paging past this returns HTTP 400
 SEARCH_MIN_INTERVAL_S = 0.25  # search is limited to 5 req/s per account
 BATCH_READ_SIZE = 50  # history reduces per-request capacity; stay well under 100
 BATCH_MIN_INTERVAL_S = 0.1
@@ -157,14 +152,12 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         self.auth_header = auth_header
         self._init_ts = init_ts
         self._init_dt = _parse_ts(init_ts)
+        if self._init_dt is None:
+            raise ValueError("HubSpot history init time must be an ISO-8601 timestamp")
         self._get_property_names = get_property_names
         self._get_cursor_property = get_cursor_property
         self._get_api_object_type = get_api_object_type or (lambda obj: obj)
         self._sleep = sleep
-        # Tables whose lookback has already been applied in this trigger.
-        # A connector instance lives for one streaming query run, so this
-        # applies the lookback once per trigger rather than on every call.
-        self._lookback_applied: set = set()
         self._last_call: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
@@ -187,135 +180,188 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
     # Read
     # ------------------------------------------------------------------
 
-    def read_table(  # pylint: disable=too-many-locals
+    def read_table(
         self, table_name: str, start_offset: dict, table_options: Dict[str, str]
     ) -> Tuple[Iterator[dict], dict]:
+        options = table_options or {}
+        start = start_offset or {}
+        watermark = self._offset_watermark(start)
+        saved = self._checked_scan(start.get("history_scan"), watermark)
+        if saved is not None and not saved["complete"]:
+            scan = dict(saved)
+        else:
+            if watermark is not None and watermark >= self._init_dt:
+                return iter([]), start
+            scan = self._new_scan(watermark, options)
+        rows, scan = self._read_scan(table_name, scan, options)
+        end = {"history_scan": scan}
+        if scan["complete"]:
+            end["updatedAt"] = scan["upper"]
+        elif watermark is not None:
+            end["updatedAt"] = start["updatedAt"]
+        return iter(rows), end
+
+    def read_between_offsets(self, table_name, start_offset, end_offset, table_options):
+        """Replay the recorded parent range, independently of admission limits."""
+        options = table_options or {}
+        start, end = start_offset or {}, end_offset or {}
+        if start == end:
+            return iter([])
+        start_watermark = self._offset_watermark(start)
+        end_watermark = self._offset_watermark(end)
+        saved_start = self._checked_scan(start.get("history_scan"), start_watermark)
+        saved_end = self._checked_scan(end.get("history_scan"), end_watermark)
+        if saved_end is not None:
+            scan = {**saved_end, "after_id": None, "complete": False,
+                    "parent_count": 0, "parent_digest": hashlib.sha256(b"").hexdigest()}
+            if saved_start is not None and not saved_start["complete"]:
+                if (saved_start["lower"], saved_start["upper"]) != (scan["lower"], scan["upper"]):
+                    raise RuntimeError("HubSpot history recovery scan bounds changed")
+                scan["after_id"] = saved_start["after_id"]
+                scan["parent_count"] = saved_start["parent_count"]
+                scan["parent_digest"] = saved_start["parent_digest"]
+            stop_id = saved_end["after_id"]
+            if stop_id is None:
+                return iter([])
+            if scan["after_id"] is not None and int(stop_id) < int(scan["after_id"]):
+                raise RuntimeError("HubSpot history recovery frontier regressed")
+        else:
+            # Checkpoints written before keyset scans contain only updatedAt.
+            if end_watermark is None:
+                raise RuntimeError("HubSpot history recovery end offset is missing")
+            scan = self._new_scan(start_watermark, options)
+            scan["upper"] = end["updatedAt"]
+            stop_id = None
+        rows, actual = self._read_scan(table_name, scan, options, recovery=True, stop_id=stop_id)
+        if saved_end is not None and (
+            actual["parent_count"] != saved_end["parent_count"] or
+            actual["parent_digest"] != saved_end["parent_digest"]
+        ):
+            raise RuntimeError("HubSpot history recovery parent membership changed; checkpoint unchanged")
+        return iter(rows)
+
+    @staticmethod
+    def _offset_watermark(offset):
+        if not isinstance(offset, dict):
+            raise RuntimeError("Malformed HubSpot history offset")
+        value = offset.get("updatedAt")
+        parsed = _parse_ts(value) if isinstance(value, str) else None
+        if "updatedAt" in offset and parsed is None:
+            raise RuntimeError("Malformed HubSpot history offset timestamp")
+        return parsed
+
+    @staticmethod
+    def _checked_scan(value, watermark):
+        if value is None:
+            return None
+        if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != 1:
+            raise RuntimeError("Malformed HubSpot history scan version")
+        if set(value) != {"version", "lower", "upper", "after_id", "complete",
+                          "parent_count", "parent_digest"}:
+            raise RuntimeError("Malformed HubSpot history scan fields")
+        upper = _parse_ts(value["upper"]) if isinstance(value["upper"], str) else None
+        lower = _parse_ts(value["lower"]) if isinstance(value["lower"], str) else None
+        if upper is None or (value["lower"] is not None and lower is None) or (lower and lower > upper):
+            raise RuntimeError("Malformed HubSpot history scan bounds")
+        if type(value["complete"]) is not bool:
+            raise RuntimeError("Malformed HubSpot history scan completion")
+        count, digest = value["parent_count"], value["parent_digest"]
+        if type(count) is not int or count < 0 or not isinstance(digest, str) or len(digest) != 64 or any(
+            char not in "0123456789abcdef" for char in digest
+        ):
+            raise RuntimeError("Malformed HubSpot history parent membership proof")
+        frontier = value["after_id"]
+        if (frontier is None) != (count == 0):
+            raise RuntimeError("Malformed HubSpot history parent count")
+        if count == 0 and digest != hashlib.sha256(b"").hexdigest():
+            raise RuntimeError("Malformed HubSpot history empty parent digest")
+        if frontier is not None:
+            HubspotPropertyHistory._parent_id(frontier)
+        if not value["complete"] and frontier is None:
+            raise RuntimeError("Malformed HubSpot history scan frontier")
+        if value["complete"] and watermark != upper:
+            raise RuntimeError("Malformed HubSpot history completed watermark")
+        if watermark is not None and watermark > upper:
+            raise RuntimeError("Malformed HubSpot history scan watermark")
+        return dict(value)
+
+    @staticmethod
+    def _parent_id(value):
+        if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+            raise RuntimeError("Malformed HubSpot history parent identity")
+        return int(value)
+
+    @staticmethod
+    def _since(options):
+        raw = options.get(OPT_SINCE)
+        value = _parse_ts(raw) if isinstance(raw, str) else None
+        if raw and value is None:
+            raise ValueError("history_since must be an ISO-8601 timestamp")
+        return value
+
+    def _new_scan(self, watermark, options):
+        since = self._since(options)
+        lower = watermark
+        if watermark is not None:
+            minutes = self._parse_int(options.get(OPT_LOOKBACK_MINUTES))
+            minutes = DEFAULT_LOOKBACK_MINUTES if minutes is None else max(0, minutes)
+            lower = datetime.fromtimestamp(watermark.timestamp() - minutes * 60, tz=timezone.utc)
+        bounds = [value for value in (lower, since) if value is not None]
+        lower = min(max(bounds), self._init_dt) if bounds else None
+        return {"version": 1, "lower": lower.isoformat() if lower else None,
+                "upper": self._init_ts, "after_id": None, "complete": False,
+                "parent_count": 0, "parent_digest": hashlib.sha256(b"").hexdigest()}
+
+    def _read_scan(self, table_name, scan, options, recovery=False, stop_id=None):
         object_type = base_object_type(table_name)
-        table_options = table_options or {}
-        start_offset = start_offset or {}
-        watermark_dt = _parse_ts(start_offset.get("updatedAt"))
-
-        # Termination: once the cursor reaches init time there is nothing
-        # left to read in this trigger.
-        if watermark_dt and self._init_dt and watermark_dt >= self._init_dt:
-            return iter([]), start_offset
-
-        lower_dt = self._lower_bound(table_name, watermark_dt, table_options)
-        since_dt = _parse_ts(table_options.get(OPT_SINCE))
-        bounds = [d for d in (lower_dt, since_dt) if d is not None]
-        # Floor for emitted history entries, and lower bound for the search.
-        entry_floor = max(bounds) if bounds else None
-        query_lower = lower_dt or since_dt
-
-        max_records = self._parse_max_records(table_options)
-        properties = self._resolve_properties(object_type, table_options)
+        properties = self._resolve_properties(object_type, options)
         cursor_property = self._get_cursor_property(object_type)
         object_type = self._get_api_object_type(object_type)
-
-        rows: List[dict] = []
-        max_updated: Optional[str] = None
-        max_updated_dt: Optional[datetime] = None
-        after: Optional[str] = None
-        fetched = 0
-        parent_updates = {}
-
+        lower = _parse_ts(scan["lower"])
+        upper = _parse_ts(scan["upper"])
+        floor = self._since(options)
+        max_records = None if recovery else self._parse_max_records(options)
+        rows = []
+        if (lower is not None and lower > upper) or (floor is not None and floor > upper):
+            return rows, {**scan, "complete": True}
         while True:
-            parents, after = self._search_changed(
-                object_type, cursor_property, query_lower, after
+            parents, has_more = self._search_changed(
+                object_type, cursor_property, lower, scan["after_id"], upper, stop_id
             )
             if not parents:
-                break
-            fetched += len(parents)
-            search_exhausted = bool(after) and fetched + SEARCH_PAGE_SIZE > SEARCH_RESULT_CAP
-            # Strict > boundary: the search filter is GTE-inclusive (plus the
-            # per-trigger lookback), so parents at or below the start watermark
-            # come back again. Emitting their rows without advancing the offset
-            # violates the SimpleDataSourceStreamReader contract (a non-empty
-            # batch MUST advance the end offset past the start) and the managed
-            # pipeline aborts with SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE.
-            # This still excludes late-indexed parents at/below the watermark;
-            # recovering those needs a replay-aware offset (see README).
-            if watermark_dt is not None:
-                parents = [
-                    p for p in parents
-                    if (d := _parse_ts(p.get("updatedAt"))) is not None
-                    and d > watermark_dt
-                ]
-                if not parents and after:
-                    if search_exhausted:
-                        raise RuntimeError(
-                            "HubSpot history search result limit reached without a complete "
-                            "new timestamp group; checkpoint unchanged"
-                        )
-                    continue
-                if not parents:
-                    break
-
-            for chunk_start in range(0, len(parents), BATCH_READ_SIZE):
-                chunk = parents[chunk_start : chunk_start + BATCH_READ_SIZE]
-                # A timestamp-only checkpoint cannot resume halfway through a
-                # group of parents sharing updatedAt. Treat admission control
-                # as a soft cap and drain that group, even across search pages.
-                if self._should_stop(rows, max_records, max_updated_dt, watermark_dt):
-                    next_updated_dt = _parse_ts(chunk[0].get("updatedAt"))
-                    if next_updated_dt and next_updated_dt > max_updated_dt:
-                        return iter(rows), self._next_offset(start_offset, max_updated)
-                results = self._batch_read_history(
-                    object_type, [p["id"] for p in chunk], properties
-                )
-                rows.extend(self._history_rows(results, entry_floor))
+                return rows, {**scan, "complete": True}
+            last_id = self._parent_id(scan["after_id"]) if scan["after_id"] is not None else -1
+            # Validate the entire page before hydrating or advancing a frontier.
+            for parent in parents:
+                identity = self._parent_id(parent.get("id")) if isinstance(parent, dict) else -1
+                modified = _parse_ts(parent.get("updatedAt")) if isinstance(parent, dict) else None
+                if identity <= last_id:
+                    raise RuntimeError("HubSpot history parent identity order did not advance")
+                if modified is None or modified > upper or (lower is not None and modified < lower):
+                    raise RuntimeError("HubSpot history parent is outside scan bounds")
+                if stop_id is not None and identity > int(stop_id):
+                    raise RuntimeError("HubSpot history parent exceeds recovery frontier")
+                last_id = identity
+            for index in range(0, len(parents), BATCH_READ_SIZE):
+                chunk = parents[index:index + BATCH_READ_SIZE]
+                results = self._batch_read_history(object_type, [p["id"] for p in chunk], properties)
+                rows.extend(self._history_rows(results, floor))
+                digest = scan["parent_digest"]
                 for parent in chunk:
-                    updated = parent.get("updatedAt")
-                    updated_dt = _parse_ts(updated)
-                    parent_updates[str(parent["id"])] = (updated, updated_dt)
-                    if updated_dt and (max_updated_dt is None or updated_dt > max_updated_dt):
-                        max_updated, max_updated_dt = updated, updated_dt
-
-            if not after:
-                break
-            # Paging ended before the next timestamp was observed, so the
-            # final group may extend beyond the Search API's result window.
-            # Return only earlier, proven-complete groups. Never checkpoint
-            # through an unseen remainder of the last timestamp group.
-            if search_exhausted:
-                complete = {
-                    object_id: update for object_id, update in parent_updates.items()
-                    if update[1] is not None and update[1] < max_updated_dt
-                }
-                if not complete:
-                    raise RuntimeError(
-                        "HubSpot history search result limit reached without a complete "
-                        "new timestamp group; checkpoint unchanged"
-                    )
-                safe_updated, _ = max(complete.values(), key=lambda update: update[1])
-                return (
-                    iter(row for row in rows if str(row["object_id"]) in complete),
-                    self._next_offset(start_offset, safe_updated),
-                )
-
-        return iter(rows), self._next_offset(start_offset, max_updated)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _lower_bound(
-        self, table_name: str, watermark_dt: Optional[datetime], table_options: Dict[str, str]
-    ) -> Optional[datetime]:
-        """Watermark minus the lookback window, applied once per trigger."""
-        if watermark_dt is None:
-            return None
-        if table_name in self._lookback_applied:
-            return watermark_dt
-        self._lookback_applied.add(table_name)
-        minutes = self._parse_int(table_options.get(OPT_LOOKBACK_MINUTES))
-        if minutes is None:
-            minutes = DEFAULT_LOOKBACK_MINUTES
-        if minutes <= 0:
-            return watermark_dt
-        return datetime.fromtimestamp(
-            watermark_dt.timestamp() - minutes * 60, tz=timezone.utc
-        )
+                    digest = hashlib.sha256(
+                        bytes.fromhex(digest) + b"\0" + parent["id"].encode("ascii")
+                    ).hexdigest()
+                scan = {**scan, "after_id": chunk[-1]["id"],
+                        "parent_count": scan["parent_count"] + len(chunk),
+                        "parent_digest": digest}
+                at_page_end = index + len(chunk) == len(parents)
+                at_end = at_page_end and not has_more
+                if stop_id is not None and int(scan["after_id"]) == int(stop_id):
+                    return rows, {**scan, "complete": True}
+                if at_end:
+                    return rows, {**scan, "complete": True}
+                if max_records is not None and len(rows) >= max_records:
+                    return rows, scan
 
     @staticmethod
     def _parse_int(raw) -> Optional[int]:
@@ -339,33 +385,6 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         # include_properties / exclude_properties apply to history tables too:
         # they bound which properties are requested in propertiesWithHistory.
         return filter_property_names(names, table_options)
-
-    @staticmethod
-    def _advanced(max_dt: Optional[datetime], watermark_dt: Optional[datetime]) -> bool:
-        if max_dt is None:
-            return False
-        return watermark_dt is None or max_dt > watermark_dt
-
-    def _should_stop(
-        self,
-        rows: List[dict],
-        max_records: Optional[int],
-        max_dt: Optional[datetime],
-        watermark_dt: Optional[datetime],
-    ) -> bool:
-        # Only stop once the cursor has moved past the start watermark,
-        # otherwise a burst of parents sharing one updatedAt would stall.
-        return (
-            max_records is not None
-            and len(rows) >= max_records
-            and self._advanced(max_dt, watermark_dt)
-        )
-
-    @staticmethod
-    def _next_offset(start_offset: dict, max_updated: Optional[str]) -> dict:
-        if not max_updated:
-            return start_offset
-        return {"updatedAt": max_updated}
 
     @staticmethod
     def _history_rows(results: List[dict], entry_floor: Optional[datetime]) -> Iterator[dict]:
@@ -395,39 +414,39 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
     # HTTP
     # ------------------------------------------------------------------
 
-    def _search_changed(
-        self,
-        object_type: str,
-        cursor_property: str,
-        lower_dt: Optional[datetime],
-        after: Optional[str],
-    ) -> Tuple[List[dict], Optional[str]]:
-        filters = []
+    def _search_changed(self, object_type, cursor_property, lower_dt, after_id,
+                        upper_dt=None, stop_id=None):
+        upper_dt = upper_dt or self._init_dt
+        filters = [{"propertyName": cursor_property, "operator": "LTE",
+                    "value": str(_to_ms(upper_dt))}]
         if lower_dt is not None:
-            filters.append(
-                {"propertyName": cursor_property, "operator": "GTE", "value": str(_to_ms(lower_dt))}
-            )
-        if self._init_dt is not None:
-            filters.append(
-                {
-                    "propertyName": cursor_property,
-                    "operator": "LTE",
-                    "value": str(_to_ms(self._init_dt)),
-                }
-            )
-        body = {
-            "filterGroups": [{"filters": filters}] if filters else [],
-            "sorts": [{"propertyName": cursor_property, "direction": "ASCENDING"}],
-            "limit": SEARCH_PAGE_SIZE,
-            "properties": [cursor_property],
-        }
-        if after:
-            body["after"] = after
+            filters.append({"propertyName": cursor_property, "operator": "GTE",
+                            "value": str(_to_ms(lower_dt))})
+        if after_id is not None:
+            filters.append({"propertyName": "hs_object_id", "operator": "GT", "value": after_id})
+        if stop_id is not None:
+            filters.append({"propertyName": "hs_object_id", "operator": "LTE", "value": stop_id})
+        body = {"filterGroups": [{"filters": filters}],
+                "sorts": [{"propertyName": "hs_object_id", "direction": "ASCENDING"}],
+                "limit": SEARCH_PAGE_SIZE, "properties": [cursor_property, "hs_object_id"]}
         url = f"{self.base_url}/crm/objects/2026-09/{object_type}/search"
         data = self._post("search", url, body, SEARCH_MIN_INTERVAL_S)
-        results = data.get("results", []) or []
-        next_after = (data.get("paging") or {}).get("next", {}).get("after")
-        return results, next_after
+        if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+            raise RuntimeError("Malformed HubSpot history search results")
+        results = data["results"]
+        if len(results) > SEARCH_PAGE_SIZE:
+            raise RuntimeError("Oversized HubSpot history search page")
+        paging = data.get("paging", {})
+        if not isinstance(paging, dict):
+            raise RuntimeError("Malformed HubSpot history search paging")
+        nxt = paging.get("next")
+        if nxt is not None and (not isinstance(nxt, dict) or
+                                not isinstance(nxt.get("after"), (str, int)) or
+                                isinstance(nxt.get("after"), bool) or str(nxt["after"]) == ""):
+            raise RuntimeError("Malformed HubSpot history search continuation")
+        if nxt is not None and not results:
+            raise RuntimeError("Empty HubSpot history search page has continuation")
+        return results, nxt is not None or len(results) == SEARCH_PAGE_SIZE
 
     def _batch_read_history(
         self, object_type: str, ids: List[str], properties: List[str]

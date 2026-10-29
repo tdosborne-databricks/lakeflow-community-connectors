@@ -85,7 +85,8 @@ def test_custom_object_id_used_for_properties_snapshot_incremental_and_history(g
         assert [(r["object_id"], r["property"], r["value"]) for r in rows] == [
             ("1", "vin", "example-vin"),
         ]
-        assert offset == {"updatedAt": stamp}
+        assert offset["updatedAt"] == conn._history._init_ts
+        assert offset["history_scan"]["complete"] is True
     assert paths.count("/crm-object-schemas/2026-09/schemas") == 1
     assert "/crm/properties/2026-09/2-12345" in paths
     assert "/crm/objects/2026-09/2-12345" in paths

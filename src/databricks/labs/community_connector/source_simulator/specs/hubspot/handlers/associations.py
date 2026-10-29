@@ -25,6 +25,9 @@ def serve_associations(prep, spec, corpus):  # pylint: disable=unused-argument
             links = links.get("results", [])
         results.append({
             "from": {"id": parent_id},
-            "to": [{"toObjectId": str(link["id"] if isinstance(link, dict) else link)} for link in links],
+            "to": [
+                {"toObjectId": str(link["id"] if isinstance(link, dict) else link)}
+                for link in links
+            ],
         })
     return _build_response(prep, status=200, payload={"status": "COMPLETE", "results": results})

@@ -153,6 +153,13 @@ class HubspotLakeflowConnect(LakeflowConnect):
             self.base_url, self.auth_header, self._custom_api_types, self._history._post
         )
 
+    def read_table_between_offsets(self, table_name, start_offset, end_offset, table_options):
+        if is_history_table(table_name):
+            return self._history.read_between_offsets(
+                table_name, start_offset, end_offset, table_options
+            )
+        return self.read_table(table_name, start_offset, table_options)[0]
+
     def _custom_api_types(self) -> List[str]:
         self._discover_custom_objects(require_access=True)
         return list(self._custom_object_types.values())
