@@ -1,4 +1,4 @@
-"""Custom simulator handler for HubSpot ``POST /crm/v3/objects/{type}/batch/read``.
+"""Custom simulator handler for HubSpot ``POST /crm/objects/2026-09/{type}/batch/read``.
 
 Batch read takes its inputs in the JSON body (``inputs`` IDs plus
 ``propertiesWithHistory``), which the declarative param-role pipeline
@@ -27,7 +27,7 @@ from databricks.labs.community_connector.source_simulator.interceptor import (
     response_from_record,
 )
 
-_PATH_RE = re.compile(r"/crm/v3/objects/(?P<object_type>[^/]+)/batch/read")
+_PATH_RE = re.compile(r"/crm/objects/2026-09/(?P<object_type>[^/]+)/batch/read")
 
 
 def serve_batch_read(

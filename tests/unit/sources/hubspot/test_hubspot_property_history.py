@@ -239,6 +239,48 @@ def test_non_429_error_is_raised_immediately():
     assert post.call_count == 1
 
 
+@pytest.mark.parametrize("status", [200, 207])
+def test_partial_history_batch_recovers_missing_parent_without_duplicates(status):
+    reader = _reader()
+    stamp = "2024-03-01T00:00:00.000Z"
+    responses = [
+        _Resp(status, {"results": [_history_result(2, stamp)]}),
+        _Resp(200, {"results": [_history_result(1, stamp)]}),
+    ]
+    with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
+        rows = reader._batch_read_history("deals", ["1", "2"], ["email"])
+    assert [row["id"] for row in rows] == ["1", "2"]
+    assert [call.kwargs["json"]["inputs"] for call in post.call_args_list] == [
+        [{"id": "1"}, {"id": "2"}], [{"id": "1"}],
+    ]
+
+
+def test_unresolved_history_batch_does_not_checkpoint_past_missing_parent(monkeypatch):
+    monkeypatch.setattr(hph, "MAX_RETRIES", 2)
+    reader = _reader()
+    start = {"updatedAt": "2024-02-01T00:00:00.000Z"}
+    stamp = "2024-03-01T00:00:00.000Z"
+    responses = [
+        _Resp(200, {"results": [_parent(1, stamp), _parent(2, stamp)]}),
+        _Resp(207, {"results": [_history_result(1, stamp)]}),
+        _Resp(207, {"results": []}),
+        _Resp(207, {"results": []}),
+    ]
+    with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
+        with pytest.raises(RuntimeError, match="incomplete.*1.*2"):
+            reader.read_table("deals_property_history", start, {})
+    assert post.call_count == 4
+    assert start == {"updatedAt": "2024-02-01T00:00:00.000Z"}
+
+
+@pytest.mark.parametrize("results", [[{"id": "unrequested"}], [{}], [None]])
+def test_history_batch_rejects_invalid_result_identity(results):
+    reader = _reader()
+    with mock.patch.object(hph.requests, "post", return_value=_Resp(200, {"results": results})):
+        with pytest.raises(RuntimeError, match="unexpected.*identity"):
+            reader._batch_read_history("deals", ["1"], ["email"])
+
+
 def test_lookback_applied_once_per_trigger():
     fake = _FakeHubspot([_parent(1, "2024-03-01T00:00:00.000Z")])
     reader = _reader()
@@ -285,18 +327,88 @@ def test_max_records_per_batch_and_convergence():
     assert all(len(b["inputs"]) <= hph.BATCH_READ_SIZE for b in fake.batch_bodies)
 
 
+@pytest.mark.parametrize("page_size", [40, 200])
+def test_batch_cap_does_not_split_equal_timestamp_parents(page_size):
+    stamp = "2026-01-01T12:00:00.000Z"
+    fake = _FakeHubspot([_parent(i, stamp) for i in range(150)], page_size=page_size)
+    reader = _reader()
+    opts = {"max_records_per_batch": "60", "history_lookback_minutes": "0"}
+    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
+        rows, offset = reader.read_table("contacts_property_history", {}, opts)
+        seen = {row["object_id"] for row in rows}
+        remaining, final_offset = reader.read_table("contacts_property_history", offset, opts)
+        seen.update(row["object_id"] for row in remaining)
+    assert seen == {str(i) for i in range(150)}
+    assert final_offset == offset == {"updatedAt": stamp}
+
+
 def test_search_result_cap_reanchors(monkeypatch):
     monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
     parents = [_parent(i, f"2024-03-01T00:00:{i:02d}.000Z") for i in range(25)]
     fake = _FakeHubspot(parents, page_size=4)
     monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
     reader = _reader()
+    opts = {"history_lookback_minutes": "0"}
     with mock.patch.object(hph.requests, "post", side_effect=fake.post):
-        rows, offset = reader.read_table("contacts_property_history", {}, {})
-    rows = list(rows)
+        rows, offset = reader.read_table("contacts_property_history", {}, opts)
+        rows = list(rows)
+        seen = {r["object_id"] for r in rows}
+        final_offset = offset
+        for _ in range(10):
+            remaining, next_offset = reader.read_table(
+                "contacts_property_history", final_offset, opts
+            )
+            seen.update(r["object_id"] for r in remaining)
+            if next_offset == final_offset:
+                break
+            final_offset = next_offset
     # Stopped before paging past the cap and checkpointed the last updatedAt.
     assert max(int(b.get("after") or 0) for b in fake.search_bodies) + 4 <= 10
     assert offset == {"updatedAt": parents[len(rows) - 1]["updatedAt"]}
+    assert seen == {str(i) for i in range(25)}
+    assert final_offset == {"updatedAt": parents[-1]["updatedAt"]}
+
+
+def test_search_cap_does_not_checkpoint_partial_timestamp_group(monkeypatch):
+    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
+    early = "2024-03-01T00:00:00.000Z"
+    tied = "2024-03-01T00:01:00.000Z"
+    parents = [_parent(0, early)] + [_parent(i, tied) for i in range(1, 9)]
+    fake = _FakeHubspot(parents, page_size=4)
+    reader = _reader()
+    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
+        rows, offset = reader.read_table("contacts_property_history", {}, {})
+        seen = {r["object_id"] for r in rows}
+        assert offset == {"updatedAt": early}
+        assert seen == {"0"}
+
+
+def test_search_cap_fails_closed_when_no_complete_timestamp_group(monkeypatch):
+    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
+    stamp = "2024-03-01T00:00:00.000Z"
+    fake = _FakeHubspot([_parent(i, stamp) for i in range(11)], page_size=4)
+    reader = _reader()
+    checkpoint = {}
+    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
+        with pytest.raises(RuntimeError, match="search result limit"):
+            reader.read_table("contacts_property_history", checkpoint, {})
+    assert checkpoint == {}
+
+
+def test_search_cap_counts_parents_discarded_by_watermark(monkeypatch):
+    monkeypatch.setattr(hph, "SEARCH_RESULT_CAP", 10)
+    monkeypatch.setattr(hph, "SEARCH_PAGE_SIZE", 4)
+    stamp = "2024-03-01T00:00:00.000Z"
+    fake = _FakeHubspot([_parent(i, stamp) for i in range(11)], page_size=4)
+    reader = _reader()
+    checkpoint = {"updatedAt": stamp}
+    with mock.patch.object(hph.requests, "post", side_effect=fake.post):
+        with pytest.raises(RuntimeError, match="search result limit"):
+            reader.read_table("contacts_property_history", checkpoint, {})
+    assert checkpoint == {"updatedAt": stamp}
+    assert max(int(b.get("after") or 0) for b in fake.search_bodies) + 4 <= 10
 
 
 def test_base_tables_offset_advance_contract(connector):

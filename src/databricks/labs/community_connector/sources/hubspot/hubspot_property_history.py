@@ -5,12 +5,12 @@ one row per (object, property, change timestamp).
 
 Read flow for one ``read_table`` call:
 
-1. **Find changed parents** via ``POST /crm/v3/objects/{type}/search``
+1. **Find changed parents** via ``POST /crm/objects/2026-09/{type}/search``
    filtered on the object's last-modified property, sorted ascending,
    bounded above by the connector's init time. Search does *not* accept
    ``propertiesWithHistory``, so it only returns IDs + ``updatedAt``.
 2. **Fetch history** for those IDs via
-   ``POST /crm/v3/objects/{type}/batch/read`` with ``propertiesWithHistory``
+   ``POST /crm/objects/2026-09/{type}/batch/read`` with ``propertiesWithHistory``
    in the JSON body (no URL-length limit, unlike the list endpoint).
 3. **Emit** one row per history entry whose timestamp is at or after the
    query's lower bound (and ``history_since``, if set).
@@ -151,6 +151,7 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         get_property_names: Callable[[str], List[str]],
         get_cursor_property: Callable[[str], str],
         sleep: Callable[[float], None] = time.sleep,
+        get_api_object_type: Optional[Callable[[str], str]] = None,
     ) -> None:
         self.base_url = base_url
         self.auth_header = auth_header
@@ -158,6 +159,7 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         self._init_dt = _parse_ts(init_ts)
         self._get_property_names = get_property_names
         self._get_cursor_property = get_cursor_property
+        self._get_api_object_type = get_api_object_type or (lambda obj: obj)
         self._sleep = sleep
         # Tables whose lookback has already been applied in this trigger.
         # A connector instance lives for one streaming query run, so this
@@ -208,12 +210,14 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         max_records = self._parse_max_records(table_options)
         properties = self._resolve_properties(object_type, table_options)
         cursor_property = self._get_cursor_property(object_type)
+        object_type = self._get_api_object_type(object_type)
 
         rows: List[dict] = []
         max_updated: Optional[str] = None
         max_updated_dt: Optional[datetime] = None
         after: Optional[str] = None
         fetched = 0
+        parent_updates = {}
 
         while True:
             parents, after = self._search_changed(
@@ -221,14 +225,16 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
             )
             if not parents:
                 break
+            fetched += len(parents)
+            search_exhausted = bool(after) and fetched + SEARCH_PAGE_SIZE > SEARCH_RESULT_CAP
             # Strict > boundary: the search filter is GTE-inclusive (plus the
             # per-trigger lookback), so parents at or below the start watermark
             # come back again. Emitting their rows without advancing the offset
             # violates the SimpleDataSourceStreamReader contract (a non-empty
             # batch MUST advance the end offset past the start) and the managed
             # pipeline aborts with SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE.
-            # Their history was already ingested when the watermark was set, so
-            # skipping them here loses nothing.
+            # This still excludes late-indexed parents at/below the watermark;
+            # recovering those needs a replay-aware offset (see README).
             if watermark_dt is not None:
                 parents = [
                     p for p in parents
@@ -236,13 +242,24 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
                     and d > watermark_dt
                 ]
                 if not parents and after:
+                    if search_exhausted:
+                        raise RuntimeError(
+                            "HubSpot history search result limit reached without a complete "
+                            "new timestamp group; checkpoint unchanged"
+                        )
                     continue
                 if not parents:
                     break
-            fetched += len(parents)
 
             for chunk_start in range(0, len(parents), BATCH_READ_SIZE):
                 chunk = parents[chunk_start : chunk_start + BATCH_READ_SIZE]
+                # A timestamp-only checkpoint cannot resume halfway through a
+                # group of parents sharing updatedAt. Treat admission control
+                # as a soft cap and drain that group, even across search pages.
+                if self._should_stop(rows, max_records, max_updated_dt, watermark_dt):
+                    next_updated_dt = _parse_ts(chunk[0].get("updatedAt"))
+                    if next_updated_dt and next_updated_dt > max_updated_dt:
+                        return iter(rows), self._next_offset(start_offset, max_updated)
                 results = self._batch_read_history(
                     object_type, [p["id"] for p in chunk], properties
                 )
@@ -250,20 +267,31 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
                 for parent in chunk:
                     updated = parent.get("updatedAt")
                     updated_dt = _parse_ts(updated)
+                    parent_updates[str(parent["id"])] = (updated, updated_dt)
                     if updated_dt and (max_updated_dt is None or updated_dt > max_updated_dt):
                         max_updated, max_updated_dt = updated, updated_dt
 
-                if self._should_stop(rows, max_records, max_updated_dt, watermark_dt):
-                    return iter(rows), self._next_offset(start_offset, max_updated)
-
             if not after:
                 break
-            # Stay under the 10k search-result cap: end this call and let the
-            # next one re-anchor the search at the latest updatedAt seen.
-            if fetched + SEARCH_PAGE_SIZE > SEARCH_RESULT_CAP and self._advanced(
-                max_updated_dt, watermark_dt
-            ):
-                break
+            # Paging ended before the next timestamp was observed, so the
+            # final group may extend beyond the Search API's result window.
+            # Return only earlier, proven-complete groups. Never checkpoint
+            # through an unseen remainder of the last timestamp group.
+            if search_exhausted:
+                complete = {
+                    object_id: update for object_id, update in parent_updates.items()
+                    if update[1] is not None and update[1] < max_updated_dt
+                }
+                if not complete:
+                    raise RuntimeError(
+                        "HubSpot history search result limit reached without a complete "
+                        "new timestamp group; checkpoint unchanged"
+                    )
+                safe_updated, _ = max(complete.values(), key=lambda update: update[1])
+                return (
+                    iter(row for row in rows if str(row["object_id"]) in complete),
+                    self._next_offset(start_offset, safe_updated),
+                )
 
         return iter(rows), self._next_offset(start_offset, max_updated)
 
@@ -395,7 +423,7 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
         }
         if after:
             body["after"] = after
-        url = f"{self.base_url}/crm/v3/objects/{object_type}/search"
+        url = f"{self.base_url}/crm/objects/2026-09/{object_type}/search"
         data = self._post("search", url, body, SEARCH_MIN_INTERVAL_S)
         results = data.get("results", []) or []
         next_after = (data.get("paging") or {}).get("next", {}).get("after")
@@ -406,14 +434,36 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
     ) -> List[dict]:
         if not ids:
             return []
-        body = {
-            "inputs": [{"id": i} for i in ids],
-            "properties": [],
-            "propertiesWithHistory": properties,
-        }
-        url = f"{self.base_url}/crm/v3/objects/{object_type}/batch/read?archived=false"
-        data = self._post("batch", url, body, BATCH_MIN_INTERVAL_S)
-        return data.get("results", []) or []
+        requested = list(dict.fromkeys(str(i) for i in ids))
+        pending = requested
+        received: Dict[str, dict] = {}
+        url = f"{self.base_url}/crm/objects/2026-09/{object_type}/batch/read?archived=false"
+        # A 207 (or even a 200) can omit requested parents. Advancing the
+        # checkpoint on that subset would permanently skip their history.
+        # Preserve successful results and retry only the unresolved IDs.
+        for attempt in range(MAX_RETRIES + 1):
+            body = {
+                "inputs": [{"id": i} for i in pending],
+                "properties": [],
+                "propertiesWithHistory": properties,
+            }
+            data = self._post("batch", url, body, BATCH_MIN_INTERVAL_S)
+            for result in data.get("results", []) or []:
+                object_id = str(result.get("id")) if isinstance(result, dict) else None
+                if object_id not in pending:
+                    raise RuntimeError("HubSpot history batch returned an unexpected object identity")
+                received[object_id] = result
+            pending = [i for i in requested if i not in received]
+            if not pending:
+                return [received[i] for i in requested]
+            if attempt < MAX_RETRIES:
+                self._sleep(min(2.0 ** attempt, MAX_BACKOFF_S))
+        # Fail closed even for a parent deleted between search and batch read.
+        # Deletion/error classification needs explicit evidence before skipping.
+        raise RuntimeError(
+            f"HubSpot history batch incomplete: {len(pending)} of "
+            f"{len(requested)} parents unresolved after retries"
+        )
 
     def _post(self, kind: str, url: str, body: dict, min_interval: float) -> dict:
         """POST with throttling and 429 retry (Retry-After or exponential backoff)."""

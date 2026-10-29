@@ -41,17 +41,17 @@ connector follows it until either:
 
 | Table        | Endpoint (full refresh)                  | Endpoint (incremental search)                  | Primary Key | Cursor Field |
 |--------------|------------------------------------------|------------------------------------------------|-------------|--------------|
-| `contacts`   | `GET /crm/v3/objects/contacts`           | `POST /crm/v3/objects/contacts/search`         | `id`        | `updatedAt`  |
-| `companies`  | `GET /crm/v3/objects/companies`          | `POST /crm/v3/objects/companies/search`        | `id`        | `updatedAt`  |
-| `deals`      | `GET /crm/v3/objects/deals`              | `POST /crm/v3/objects/deals/search`            | `id`        | `updatedAt`  |
-| `tickets`    | `GET /crm/v3/objects/tickets`            | `POST /crm/v3/objects/tickets/search`          | `id`        | `updatedAt`  |
-| `calls`      | `GET /crm/v3/objects/calls`              | `POST /crm/v3/objects/calls/search`            | `id`        | `updatedAt`  |
-| `emails`     | `GET /crm/v3/objects/emails`             | `POST /crm/v3/objects/emails/search`           | `id`        | `updatedAt`  |
-| `meetings`   | `GET /crm/v3/objects/meetings`           | `POST /crm/v3/objects/meetings/search`         | `id`        | `updatedAt`  |
-| `tasks`      | `GET /crm/v3/objects/tasks`              | `POST /crm/v3/objects/tasks/search`            | `id`        | `updatedAt`  |
-| `notes`      | `GET /crm/v3/objects/notes`              | `POST /crm/v3/objects/notes/search`            | `id`        | `updatedAt`  |
+| `contacts`   | `GET /crm/objects/2026-09/contacts`           | `POST /crm/objects/2026-09/contacts/search`         | `id`        | `updatedAt`  |
+| `companies`  | `GET /crm/objects/2026-09/companies`          | `POST /crm/objects/2026-09/companies/search`        | `id`        | `updatedAt`  |
+| `deals`      | `GET /crm/objects/2026-09/deals`              | `POST /crm/objects/2026-09/deals/search`            | `id`        | `updatedAt`  |
+| `tickets`    | `GET /crm/objects/2026-09/tickets`            | `POST /crm/objects/2026-09/tickets/search`          | `id`        | `updatedAt`  |
+| `calls`      | `GET /crm/objects/2026-09/calls`              | `POST /crm/objects/2026-09/calls/search`            | `id`        | `updatedAt`  |
+| `emails`     | `GET /crm/objects/2026-09/emails`             | `POST /crm/objects/2026-09/emails/search`           | `id`        | `updatedAt`  |
+| `meetings`   | `GET /crm/objects/2026-09/meetings`           | `POST /crm/objects/2026-09/meetings/search`         | `id`        | `updatedAt`  |
+| `tasks`      | `GET /crm/objects/2026-09/tasks`              | `POST /crm/objects/2026-09/tasks/search`            | `id`        | `updatedAt`  |
+| `notes`      | `GET /crm/objects/2026-09/notes`              | `POST /crm/objects/2026-09/notes/search`            | `id`        | `updatedAt`  |
 
-Custom objects discovered via `GET /crm/v3/schemas` are exposed as additional
+Custom objects discovered via `GET /crm-object-schemas/2026-09/schemas` are exposed as additional
 tables using the same patterns as the standard objects above.
 
 ### Cursor property mapping
@@ -79,10 +79,27 @@ incremental.
 Each table's column set is discovered at runtime via:
 
 ```
-GET /properties/v2/{type}/properties
+GET /crm/properties/2026-09/{type}
 ```
 
 The connector caches the schema per `HubspotLakeflowConnect` instance.
+
+Property responses wrap fields in `results`. Custom schema discovery uses
+`GET /crm-object-schemas/2026-09/schemas`; returned directional association
+definitions resolve columns by canonical objectTypeId after collecting all schemas.
+
+## Complete association reads
+
+`POST /crm/associations/2026-09/{fromType}/{toType}/batch/read` receives
+`inputs: [{id}]`. Each result has `from.id`, `to[].toObjectId` and optional
+per-parent `paging.next.after`. Continue with `{id, after}` for that parent.
+The connector drains all pages and reconciles every requested parent before
+publishing rows. HTTP207 is not sufficient evidence of a complete result.
+
+Association-only changes are not guaranteed to advance a searched parent cursor.
+The optional `association_sync_mode=full_refresh` returns snapshot metadata and
+performs a complete parent/association scan each update; the default incremental
+mode covers only parents selected by Search.
 
 ## Search API request shape
 
@@ -117,10 +134,10 @@ HubSpot's OpenAPI specs for the CRM objects API):
 
 | Endpoint | `propertiesWithHistory` | Notes |
 |---|---|---|
-| `GET /crm/v3/objects/{type}/{id}` | yes (query) | one object |
-| `GET /crm/v3/objects/{type}` (list) | yes (query) | "will reduce the maximum number of [objects] that can be read by a single request"; long property lists hit URL-length limits |
-| `POST /crm/v3/objects/{type}/batch/read` | yes (body) | up to 100 IDs; may return `207` with per-ID errors |
-| `POST /crm/v3/objects/{type}/search` | **no** | request schema is `after`, `filterGroups`, `limit`, `properties`, `query`, `sorts` |
+| `GET /crm/objects/2026-09/{type}/{id}` | yes (query) | one object |
+| `GET /crm/objects/2026-09/{type}` (list) | yes (query) | "will reduce the maximum number of [objects] that can be read by a single request"; long property lists hit URL-length limits |
+| `POST /crm/objects/2026-09/{type}/batch/read` | yes (body) | up to 100 IDs; may return `207` with per-ID errors |
+| `POST /crm/objects/2026-09/{type}/search` | **no** | request schema is `after`, `filterGroups`, `limit`, `properties`, `query`, `sorts` |
 
 Each history entry (`ValueWithTimestamp`) has `value`, `timestamp`,
 `sourceType` (required) and `sourceId`, `sourceLabel`, `updatedByUserId`
@@ -128,10 +145,10 @@ Each history entry (`ValueWithTimestamp`) has `value`, `timestamp`,
 
 ### Read pattern
 
-1. `POST /crm/v3/objects/{type}/search` with `GTE <cursor - lookback>` and
+1. `POST /crm/objects/2026-09/{type}/search` with `GTE <cursor - lookback>` and
    `LTE <init_ts>` on the cursor property, ascending, `limit: 200`, returning
    only IDs and `updatedAt`.
-2. `POST /crm/v3/objects/{type}/batch/read` with up to 50 IDs and
+2. `POST /crm/objects/2026-09/{type}/batch/read` with up to 50 IDs and
    `propertiesWithHistory` (all properties from the Properties API, or the
    `history_properties` table option).
 3. One output row per history entry; entries older than the query's lower

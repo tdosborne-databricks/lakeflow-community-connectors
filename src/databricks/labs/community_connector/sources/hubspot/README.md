@@ -2,6 +2,11 @@
 
 The Lakeflow HubSpot Connector allows you to extract data from your HubSpot instance and load it into your data lake or warehouse. This connector supports both incremental and full refresh synchronization patterns for HubSpot objects.
 
+This is an open-source community connector with no Databricks SLA or certification.
+CRM schema, property, object, history and association reads use the pinned HubSpot
+`2026-09` API release. Public API documentation is the contract; live acceptance
+must also be verified against the target account's permissions and subscription.
+
 ## Set up
 
 ### Prerequisites
@@ -55,6 +60,28 @@ The HubSpot connector supports the following CRM objects with dynamic schema dis
 | `<custom_object>_property_history` | `object_id`, `property`, `timestamp` | `timestamp` | – |
 
 > **Note**: Table names are case-sensitive. Use the exact names shown above (lowercase with underscores). Custom objects are also supported and will be discovered automatically, each with a matching `<custom_object>_property_history` table.
+
+### Custom objects and associations
+
+Custom table names remain the lowercase schema names; API calls use their
+canonical `objectTypeId`. Directional schema association definitions add one
+target ID-array column per related object, including custom-to-custom and
+self-associations. The connector rejects ambiguous names and unsupported target
+types instead of silently dropping relationships.
+
+Object snapshot and incremental reads both hydrate relationships through the
+2026-09 association batch API. Each parent has its own pagination cursor. IDs are
+deduplicated and sorted across pages and labels. Empty arrays mean a successful
+empty read. Missing parents are retried; incomplete responses or invalid cursors
+fail the read before it returns a new checkpoint.
+
+The default incremental mode refreshes associations only for parents selected by
+their modification timestamp. HubSpot does not guarantee that association-only
+changes update that timestamp. Set `association_sync_mode=full_refresh` on an
+object table to advertise snapshot ingestion and enumerate all current parents
+and relationships on each pipeline update. This reconciles association removals
+without requiring a parent property change, at the cost of a complete scan.
+Property-history tables retain their own ingestion strategy.
 
 ### Object Details
 
@@ -130,8 +157,15 @@ The HubSpot connector supports the following CRM objects with dynamic schema dis
 - **Primary Key**: `object_id`, `property`, `timestamp`
 - **Cursor Field**: `timestamp`
 - **Schema**: `object_id`, `property`, `value`, `timestamp`, `source_type`, `source_id`, `source_label`, `updated_by_user_id`
-- **How it reads**: the Search API finds objects whose last-modified date changed since the last run (Search does not return history), then the Batch Read API (`POST /crm/v3/objects/{object}/batch/read`) fetches `propertiesWithHistory` for those objects, up to 50 IDs per call.
-- **Rate limiting**: Search calls are spaced to stay under HubSpot's 5 requests/second Search limit, and HTTP 429 responses are retried (honouring `Retry-After`, otherwise exponential backoff, up to 5 retries). A single read stops before reaching the Search API's 10,000-result cap and resumes from the latest `updatedAt` on the next microbatch.
+- **How it reads**: the Search API finds objects whose last-modified date changed since the last run (Search does not return history), then the Batch Read API (`POST /crm/objects/2026-09/{object}/batch/read`) fetches `propertiesWithHistory` for those objects, up to 50 IDs per call.
+- **Rate limiting**: Search calls are spaced to stay under HubSpot's 5 requests/second Search limit, and HTTP 429 responses are retried (honouring `Retry-After`, otherwise exponential backoff, up to 5 retries). Before paging past the Search API's 10,000-result cap, the connector returns only timestamp groups proven complete by observing a later timestamp. The final group is reread next time. If no complete new group fits in the search window, the read fails without advancing its checkpoint.
+- **Partial history responses**: The connector reconciles returned parent IDs against every requested batch, including HTTP 200 and 207 responses. It retries only missing IDs, up to 5 times. If any remain unresolved, the read fails before returning a new checkpoint. This also applies to records deleted between search and batch read; the connector does not silently discard their missing history.
+
+Known completeness limits remain: the current timestamp-only checkpoint cannot
+recover late-indexed parents at or below its watermark, despite the lookback
+search window. A timestamp group that fills the Search API's result window
+blocks ingestion until a different pagination strategy is available; it is not
+silently skipped. Neither case is resolved by the partial-response retry.
 - **Scopes**: the same `crm.objects.<object>.read` scope as the parent object.
 - **Known limitation**: changes that do not update the object's last-modified date (some calculated, rollup, or formula properties) are not detected until the object is next modified.
 
@@ -169,12 +203,13 @@ These are set inside the `table_configuration` map alongside any source-specific
 
 | Option | Applies to | Default | Description |
 |---|---|---|---|
-| `max_records_per_batch` | all incremental tables | no cap | Maximum records returned per microbatch. For property history tables the cap is checked after each Batch Read call, so a microbatch can exceed it by up to one call's worth of rows. |
+| `max_records_per_batch` | all incremental tables | no cap | Soft limit on records returned per microbatch. Object and property-history reads drain parents sharing the last processed `updatedAt`, including across search pages, before stopping. A timestamp group can exceed this value by more than one batch. |
+| `association_sync_mode` | object tables | `incremental` | `incremental` refreshes selected changed parents. `full_refresh` uses snapshot ingestion and reconciles all current relationships on every update. Add this option to an existing UC connection's external options allowlist before using it. |
 | `history_properties` | `*_property_history` | all properties | Comma-separated property names to fetch history for (e.g. `lifecyclestage,hs_lead_status,dealstage`). Recommended for portals with many properties, because requesting history for every property makes each Batch Read response larger. |
 | `include_properties` | all tables | all properties | Comma-separated allowlist of properties to ingest. If set, only these discovered properties are read and exposed in the schema (unknown names are ignored, matching HubSpot's behavior). Required for objects with very many properties — full refresh fails with HTTP 414 once the request URL passes ~22,000 characters (objects with 1,000+ properties always exceed this). The object's cursor property is always retained. |
 | `exclude_properties` | all tables | none | Comma-separated list of properties to drop from ingestion. Applied after `include_properties`. |
 | `history_since` | `*_property_history` | none | ISO-8601 timestamp (e.g. `2025-01-01T00:00:00Z`). Only objects modified on or after this time are read, and older history entries are dropped. Caps the initial backfill. |
-| `history_lookback_minutes` | `*_property_history` | `10` | Minutes subtracted from the saved cursor once per pipeline update, to pick up objects that were not yet indexed by the Search API in the previous run. Set to `0` to disable. |
+| `history_lookback_minutes` | `*_property_history` | `10` | Minutes subtracted from the saved cursor for the first search in a pipeline update. The current strict watermark filter still drops parents at or below the cursor, so this does not yet recover late-indexed parents. Set to `0` to disable. |
 
 `include_properties` / `exclude_properties` also apply to `*_property_history` tables (they bound which properties are requested in `propertiesWithHistory`; `history_properties` still narrows further for history reads). Two operational notes:
 

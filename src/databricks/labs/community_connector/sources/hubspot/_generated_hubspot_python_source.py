@@ -599,6 +599,126 @@ def register_lakeflow_source(spark):
 
 
     ########################################################
+    # src/databricks/labs/community_connector/sources/hubspot/hubspot_associations.py
+    ########################################################
+
+    ASSOCIATION_BATCH_READ_SIZE = 1000
+    ASSOCIATION_MIN_INTERVAL_S = 0.11
+    ASSOCIATION_MAX_RETRIES = 5
+    ASSOCIATION_MAX_BACKOFF_S = 30.0
+
+
+    def _association_identifier(value, kind: str) -> str:
+        # HubSpot may encode object IDs as JSON numbers or strings. Never coerce
+        # booleans, nulls, containers or fractional numbers into plausible IDs.
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return str(value)
+        if isinstance(value, str) and value and value.strip() == value:
+            return value
+        raise RuntimeError(f"Malformed HubSpot association {kind}")
+
+
+    def _association_next_cursor(result: dict):
+        if "paging" not in result:
+            return None
+        paging = result["paging"]
+        if not isinstance(paging, dict):
+            raise RuntimeError("Malformed HubSpot association paging")
+        if "next" not in paging:
+            return None
+        next_page = paging["next"]
+        if not isinstance(next_page, dict) or "after" not in next_page:
+            raise RuntimeError("Malformed HubSpot association next page")
+        return _association_identifier(next_page["after"], "cursor")
+
+
+    class HubspotAssociations:
+        """Read all associations for each requested parent, or raise."""
+
+        def __init__(
+            self,
+            base_url: str,
+            post: Callable[[str, str, dict, float], dict],
+            sleep: Callable[[float], None] = time.sleep,
+        ) -> None:
+            self.base_url = base_url.rstrip("/")
+            self._post = post
+            self._sleep = sleep
+
+        def read(self, from_type: str, to_type: str, parent_ids: list[str]) -> dict[str, list[str]]:
+            """Return sorted unique target IDs; retry omissions at their current cursor.
+
+            Five additional attempts are allowed for each unresolved parent/page.
+            Successful pages reset that budget, so legitimate page counts are unlimited.
+            Non-COMPLETE batches are validated but their results are not committed.
+            """
+            parents = [_association_identifier(parent, "requested parent ID") for parent in parent_ids]
+            if len(set(parents)) != len(parents):
+                raise RuntimeError("Duplicate HubSpot association requested parent ID")
+            targets = {parent: set() for parent in parents}
+            url = (
+                f"{self.base_url}/crm/associations/2026-09/"
+                f"{from_type}/{to_type}/batch/read"
+            )
+            for start in range(0, len(parents), ASSOCIATION_BATCH_READ_SIZE):
+                pending = dict.fromkeys(parents[start : start + ASSOCIATION_BATCH_READ_SIZE])
+                retries = dict.fromkeys(pending, 0)
+                seen = {parent: set() for parent in pending}
+                while pending:
+                    inputs = [
+                        {"id": parent, **({"after": cursor} if cursor is not None else {})}
+                        for parent, cursor in pending.items()
+                    ]
+                    data = self._post("associations", url, {"inputs": inputs}, ASSOCIATION_MIN_INTERVAL_S)
+                    results = self._validate_results(data, pending)
+                    unresolved = []
+                    for parent in list(pending):
+                        if data.get("status") != "COMPLETE" or parent not in results:
+                            if retries[parent] >= ASSOCIATION_MAX_RETRIES:
+                                raise RuntimeError("Incomplete HubSpot associations: exhausted retries")
+                            retries[parent] += 1
+                            unresolved.append(retries[parent])
+                            continue
+                        ids, cursor = results[parent]
+                        if cursor is not None and cursor in seen[parent]:
+                            raise RuntimeError("Repeated or cyclic HubSpot association cursor")
+                        targets[parent].update(ids)
+                        if cursor is None:
+                            del pending[parent]
+                        else:
+                            seen[parent].add(cursor)
+                            pending[parent] = cursor
+                            retries[parent] = 0
+                    if unresolved:
+                        self._sleep(min(2.0 ** (max(unresolved) - 1), ASSOCIATION_MAX_BACKOFF_S))
+            return {parent: sorted(ids) for parent, ids in targets.items()}
+
+        @staticmethod
+        def _validate_results(data, pending: dict) -> dict:
+            if not isinstance(data, dict):
+                raise RuntimeError("Malformed HubSpot association batch")
+            results = data.get("results", [])
+            if not isinstance(results, list):
+                raise RuntimeError("Malformed HubSpot association results")
+            parsed = {}
+            for result in results:
+                if not isinstance(result, dict) or not isinstance(result.get("from"), dict):
+                    raise RuntimeError("Malformed HubSpot association parent")
+                parent = _association_identifier(result["from"].get("id"), "parent ID")
+                if parent not in pending or parent in parsed:
+                    raise RuntimeError("Unrequested or duplicate HubSpot association parent")
+                if not isinstance(result.get("to"), list):
+                    raise RuntimeError("Malformed HubSpot association target list")
+                ids = set()
+                for target in result["to"]:
+                    if not isinstance(target, dict):
+                        raise RuntimeError("Malformed HubSpot association target")
+                    ids.add(_association_identifier(target.get("toObjectId"), "target ID"))
+                parsed[parent] = (ids, _association_next_cursor(result))
+            return parsed
+
+
+    ########################################################
     # src/databricks/labs/community_connector/sources/hubspot/hubspot_property_history.py
     ########################################################
 
@@ -725,6 +845,7 @@ def register_lakeflow_source(spark):
             get_property_names: Callable[[str], List[str]],
             get_cursor_property: Callable[[str], str],
             sleep: Callable[[float], None] = time.sleep,
+            get_api_object_type: Optional[Callable[[str], str]] = None,
         ) -> None:
             self.base_url = base_url
             self.auth_header = auth_header
@@ -732,6 +853,7 @@ def register_lakeflow_source(spark):
             self._init_dt = _parse_ts(init_ts)
             self._get_property_names = get_property_names
             self._get_cursor_property = get_cursor_property
+            self._get_api_object_type = get_api_object_type or (lambda obj: obj)
             self._sleep = sleep
             # Tables whose lookback has already been applied in this trigger.
             # A connector instance lives for one streaming query run, so this
@@ -782,12 +904,14 @@ def register_lakeflow_source(spark):
             max_records = self._parse_max_records(table_options)
             properties = self._resolve_properties(object_type, table_options)
             cursor_property = self._get_cursor_property(object_type)
+            object_type = self._get_api_object_type(object_type)
 
             rows: List[dict] = []
             max_updated: Optional[str] = None
             max_updated_dt: Optional[datetime] = None
             after: Optional[str] = None
             fetched = 0
+            parent_updates = {}
 
             while True:
                 parents, after = self._search_changed(
@@ -795,14 +919,16 @@ def register_lakeflow_source(spark):
                 )
                 if not parents:
                     break
+                fetched += len(parents)
+                search_exhausted = bool(after) and fetched + SEARCH_PAGE_SIZE > SEARCH_RESULT_CAP
                 # Strict > boundary: the search filter is GTE-inclusive (plus the
                 # per-trigger lookback), so parents at or below the start watermark
                 # come back again. Emitting their rows without advancing the offset
                 # violates the SimpleDataSourceStreamReader contract (a non-empty
                 # batch MUST advance the end offset past the start) and the managed
                 # pipeline aborts with SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE.
-                # Their history was already ingested when the watermark was set, so
-                # skipping them here loses nothing.
+                # This still excludes late-indexed parents at/below the watermark;
+                # recovering those needs a replay-aware offset (see README).
                 if watermark_dt is not None:
                     parents = [
                         p for p in parents
@@ -810,13 +936,24 @@ def register_lakeflow_source(spark):
                         and d > watermark_dt
                     ]
                     if not parents and after:
+                        if search_exhausted:
+                            raise RuntimeError(
+                                "HubSpot history search result limit reached without a complete "
+                                "new timestamp group; checkpoint unchanged"
+                            )
                         continue
                     if not parents:
                         break
-                fetched += len(parents)
 
                 for chunk_start in range(0, len(parents), BATCH_READ_SIZE):
                     chunk = parents[chunk_start : chunk_start + BATCH_READ_SIZE]
+                    # A timestamp-only checkpoint cannot resume halfway through a
+                    # group of parents sharing updatedAt. Treat admission control
+                    # as a soft cap and drain that group, even across search pages.
+                    if self._should_stop(rows, max_records, max_updated_dt, watermark_dt):
+                        next_updated_dt = _parse_ts(chunk[0].get("updatedAt"))
+                        if next_updated_dt and next_updated_dt > max_updated_dt:
+                            return iter(rows), self._next_offset(start_offset, max_updated)
                     results = self._batch_read_history(
                         object_type, [p["id"] for p in chunk], properties
                     )
@@ -824,20 +961,31 @@ def register_lakeflow_source(spark):
                     for parent in chunk:
                         updated = parent.get("updatedAt")
                         updated_dt = _parse_ts(updated)
+                        parent_updates[str(parent["id"])] = (updated, updated_dt)
                         if updated_dt and (max_updated_dt is None or updated_dt > max_updated_dt):
                             max_updated, max_updated_dt = updated, updated_dt
 
-                    if self._should_stop(rows, max_records, max_updated_dt, watermark_dt):
-                        return iter(rows), self._next_offset(start_offset, max_updated)
-
                 if not after:
                     break
-                # Stay under the 10k search-result cap: end this call and let the
-                # next one re-anchor the search at the latest updatedAt seen.
-                if fetched + SEARCH_PAGE_SIZE > SEARCH_RESULT_CAP and self._advanced(
-                    max_updated_dt, watermark_dt
-                ):
-                    break
+                # Paging ended before the next timestamp was observed, so the
+                # final group may extend beyond the Search API's result window.
+                # Return only earlier, proven-complete groups. Never checkpoint
+                # through an unseen remainder of the last timestamp group.
+                if search_exhausted:
+                    complete = {
+                        object_id: update for object_id, update in parent_updates.items()
+                        if update[1] is not None and update[1] < max_updated_dt
+                    }
+                    if not complete:
+                        raise RuntimeError(
+                            "HubSpot history search result limit reached without a complete "
+                            "new timestamp group; checkpoint unchanged"
+                        )
+                    safe_updated, _ = max(complete.values(), key=lambda update: update[1])
+                    return (
+                        iter(row for row in rows if str(row["object_id"]) in complete),
+                        self._next_offset(start_offset, safe_updated),
+                    )
 
             return iter(rows), self._next_offset(start_offset, max_updated)
 
@@ -969,7 +1117,7 @@ def register_lakeflow_source(spark):
             }
             if after:
                 body["after"] = after
-            url = f"{self.base_url}/crm/v3/objects/{object_type}/search"
+            url = f"{self.base_url}/crm/objects/2026-09/{object_type}/search"
             data = self._post("search", url, body, SEARCH_MIN_INTERVAL_S)
             results = data.get("results", []) or []
             next_after = (data.get("paging") or {}).get("next", {}).get("after")
@@ -980,14 +1128,36 @@ def register_lakeflow_source(spark):
         ) -> List[dict]:
             if not ids:
                 return []
-            body = {
-                "inputs": [{"id": i} for i in ids],
-                "properties": [],
-                "propertiesWithHistory": properties,
-            }
-            url = f"{self.base_url}/crm/v3/objects/{object_type}/batch/read?archived=false"
-            data = self._post("batch", url, body, BATCH_MIN_INTERVAL_S)
-            return data.get("results", []) or []
+            requested = list(dict.fromkeys(str(i) for i in ids))
+            pending = requested
+            received: Dict[str, dict] = {}
+            url = f"{self.base_url}/crm/objects/2026-09/{object_type}/batch/read?archived=false"
+            # A 207 (or even a 200) can omit requested parents. Advancing the
+            # checkpoint on that subset would permanently skip their history.
+            # Preserve successful results and retry only the unresolved IDs.
+            for attempt in range(MAX_RETRIES + 1):
+                body = {
+                    "inputs": [{"id": i} for i in pending],
+                    "properties": [],
+                    "propertiesWithHistory": properties,
+                }
+                data = self._post("batch", url, body, BATCH_MIN_INTERVAL_S)
+                for result in data.get("results", []) or []:
+                    object_id = str(result.get("id")) if isinstance(result, dict) else None
+                    if object_id not in pending:
+                        raise RuntimeError("HubSpot history batch returned an unexpected object identity")
+                    received[object_id] = result
+                pending = [i for i in requested if i not in received]
+                if not pending:
+                    return [received[i] for i in requested]
+                if attempt < MAX_RETRIES:
+                    self._sleep(min(2.0 ** attempt, MAX_BACKOFF_S))
+            # Fail closed even for a parent deleted between search and batch read.
+            # Deletion/error classification needs explicit evidence before skipping.
+            raise RuntimeError(
+                f"HubSpot history batch incomplete: {len(pending)} of "
+                f"{len(requested)} parents unresolved after retries"
+            )
 
         def _post(self, kind: str, url: str, body: dict, min_interval: float) -> dict:
             """POST with throttling and 429 retry (Retry-After or exponential backoff)."""
@@ -1030,6 +1200,12 @@ def register_lakeflow_source(spark):
     ########################################################
 
     class HubspotLakeflowConnect(LakeflowConnect):
+        _STANDARD_OBJECT_TYPES = {
+            "contacts": "0-1", "companies": "0-2", "deals": "0-3", "tickets": "0-5",
+            "calls": "0-48", "emails": "0-49", "meetings": "0-47", "tasks": "0-27",
+            "notes": "0-46",
+        }
+
         def __init__(self, options: dict) -> None:
             self.access_token = options["access_token"]
             self.base_url = "https://api.hubapi.com"
@@ -1041,6 +1217,9 @@ def register_lakeflow_source(spark):
             self._schema_cache = {}
             # Cache for table metadata
             self._metadata_cache = {}
+            self._custom_objects = None
+            self._custom_object_types = {}
+            self._custom_object_configs = {}
 
             # Freeze the upper cursor bound at init time so read_table returns a
             # stable cursor across microbatches in a single Trigger.AvailableNow
@@ -1141,7 +1320,9 @@ def register_lakeflow_source(spark):
                 get_cursor_property=lambda obj: self._get_object_config(obj)[
                     "cursor_property_field"
                 ],
+                get_api_object_type=self._get_api_object_type,
             )
+            self._associations = HubspotAssociations(self.base_url, self._history._post)
 
         def list_tables(self) -> list[str]:
             """
@@ -1161,12 +1342,8 @@ def register_lakeflow_source(spark):
             ]
 
             # Add dynamic discovery of custom objects
-            custom_objects = []
-            try:
-                custom_objects = self._discover_custom_objects()
-                standard_tables.extend(custom_objects)
-            except Exception as e:
-                print(f"Warning: Could not discover custom objects: {e}")
+            custom_objects = self._discover_custom_objects()
+            standard_tables.extend(custom_objects)
 
             # Property history tables for the core CRM objects and custom objects
             history_tables = [
@@ -1178,33 +1355,80 @@ def register_lakeflow_source(spark):
             """
             Discover custom objects from HubSpot CRM schemas API
             """
-            try:
-                url = f"{self.base_url}/crm/v3/schemas"
-                resp = requests.get(url, headers=self.auth_header, timeout=60)
-
-                if resp.status_code != 200:
-                    return []
-
-                data = resp.json()
-                custom_objects = []
-
-                # Extract custom object names
-                for schema in data.get("results", []):
-                    object_type = schema.get("objectTypeId", "")
-                    name = schema.get("name", "")
-
-                    # Skip standard objects, only include custom ones
-                    if object_type not in ["0-1", "0-2", "0-3", "0-5"] and name:
-                        custom_objects.append(name.lower())
-
-                return custom_objects
-            except Exception as e:
-                print(f"Error discovering custom objects: {e}")
+            if self._custom_objects is not None:
+                return list(self._custom_objects)
+            url = f"{self.base_url}/crm-object-schemas/2026-09/schemas"
+            resp = requests.get(url, headers=self.auth_header, timeout=60)
+            # Schema access is optional for accounts ingesting only standard CRM
+            # objects. Do not cache a denied response as successful empty discovery.
+            if resp.status_code == 403:
                 return []
+            if resp.status_code != 200:
+                raise RuntimeError(f"HubSpot schema discovery failed: HTTP {resp.status_code}")
+            schemas = resp.json().get("results")
+            if not isinstance(schemas, list):
+                raise RuntimeError("Malformed HubSpot schema discovery results")
+            names_by_type = {v: k for k, v in self._STANDARD_OBJECT_TYPES.items()}
+            custom_types = {}
+            for schema in schemas:
+                if not isinstance(schema, dict):
+                    raise RuntimeError("Malformed HubSpot custom schema")
+                object_type, name = schema.get("objectTypeId"), schema.get("name")
+                if object_type in self._STANDARD_OBJECT_TYPES.values():
+                    continue
+                if not isinstance(object_type, str) or not object_type.startswith("2-") or not isinstance(name, str) or not name:
+                    raise RuntimeError("HubSpot custom schema requires name and objectTypeId")
+                alias = name.lower()
+                if alias in self._object_config or alias in custom_types or object_type in names_by_type or is_history_table(alias):
+                    raise RuntimeError("HubSpot custom schema has a conflicting identity")
+                custom_types[alias] = object_type
+                names_by_type[object_type] = alias
+
+            configs = {name: {**config, "associations": list(config["associations"])} for name, config in self._object_config.items()}
+            configs.update({name: {**self._default_object_config, "associations": []} for name in custom_types})
+            reserved = {"id", "createdat", "updatedat", "archived", "properties"}
+            # Resolve after collecting every type so custom/custom relationships do
+            # not depend on schema order. Definitions are directional, not inferred.
+            discovered = {name: set() for name in configs}
+            for schema in schemas:
+                definitions = schema.get("associations", [])
+                if not isinstance(definitions, list):
+                    raise RuntimeError("Malformed HubSpot association definitions")
+                for definition in definitions:
+                    if not isinstance(definition, dict):
+                        raise RuntimeError("Malformed HubSpot association definition")
+                    source = names_by_type.get(definition.get("fromObjectTypeId"))
+                    target = names_by_type.get(definition.get("toObjectTypeId"))
+                    if source is None or target is None:
+                        raise RuntimeError("Unsupported HubSpot association object type")
+                    if target.lower() in reserved:
+                        raise RuntimeError("HubSpot association column conflicts with a base field")
+                    discovered[source].add(target)
+            for name, targets in discovered.items():
+                configs[name]["associations"].extend(sorted(targets - set(configs[name]["associations"])))
+            # Commit discovery atomically: failures must not leave a partial graph.
+            self._custom_object_types = custom_types
+            self._custom_object_configs = {name: configs[name] for name in custom_types}
+            self._object_config = {name: configs[name] for name in self._object_config}
+            self._custom_objects = list(custom_types)
+            return list(self._custom_objects)
+
+        def _get_api_object_type(self, table_name: str) -> str:
+            """Keep public table names stable, but address custom types by HubSpot ID."""
+            if table_name not in self._object_config:
+                self._discover_custom_objects()
+            return self._custom_object_types.get(table_name, table_name)
 
         def _get_object_config(self, table_name: str) -> Dict:
             """Get configuration for a specific object type"""
-            return self._object_config.get(table_name, self._default_object_config)
+            return self._object_config.get(table_name, self._custom_object_configs.get(table_name, self._default_object_config))
+
+        @staticmethod
+        def _association_sync_mode(table_options: Dict[str, str] | None) -> str:
+            mode = (table_options or {}).get("association_sync_mode", "incremental")
+            if mode not in ("incremental", "full_refresh"):
+                raise ValueError("association_sync_mode must be incremental or full_refresh")
+            return mode
 
         def get_table_schema(
             self, table_name: str, table_options: Dict[str, str]
@@ -1344,6 +1568,8 @@ def register_lakeflow_source(spark):
             # Use cdc_with_deletes only for tables that support archived queries
             supports_deletes = config.get("supports_deletes", False)
             ingestion_type = "cdc_with_deletes" if supports_deletes else "cdc"
+            if self._association_sync_mode(table_options) == "full_refresh":
+                ingestion_type = "snapshot"
 
             return {
                 "primary_keys": config["primary_keys"],
@@ -1413,7 +1639,8 @@ def register_lakeflow_source(spark):
             """
             Fetch object properties from HubSpot Properties API
             """
-            url = f"{self.base_url}/properties/v2/{object_type}/properties"
+            api_type = self._get_api_object_type(object_type)
+            url = f"{self.base_url}/crm/properties/2026-09/{api_type}"
 
             try:
                 resp = requests.get(url, headers=self.auth_header, timeout=60)
@@ -1423,7 +1650,7 @@ def register_lakeflow_source(spark):
                         f"{resp.status_code} {resp.text}"
                     )
 
-                return resp.json()
+                return resp.json()["results"]
             except Exception as e:
                 # Re-raise (don't return an error dict): callers iterate this as a
                 # list of property dicts, so a dict here turns a real API error into
@@ -1480,6 +1707,9 @@ def register_lakeflow_source(spark):
             is_incremental = (
                 start_offset is not None and start_offset.get("updatedAt") is not None
             )
+            if self._association_sync_mode(table_options) == "full_refresh":
+                is_incremental = False
+                start_offset = {}
 
             return self._read_data(
                 table_name,
@@ -1615,25 +1845,21 @@ def register_lakeflow_source(spark):
             while True:
                 if incremental:
                     # Use search API for incremental reads
-                    records, after, updated_time = self._fetch_incremental_batch(
+                    records, after, _ = self._fetch_incremental_batch(
                         table_name,
                         property_names,
                         cursor_property_field,
                         start_offset,
                         after,
                     )
-                    if updated_time and (
-                        not latest_updated or updated_time > latest_updated
-                    ):
-                        latest_updated = updated_time
                     # Strict > boundary: the search filter is GTE-inclusive, so the
                     # record that set the watermark is returned again. Re-emitting it
                     # without advancing the offset violates the
                     # SimpleDataSourceStreamReader contract (a non-empty batch MUST
                     # advance the end offset past the start) and the managed pipeline
                     # aborts with SIMPLE_STREAM_READER_OFFSET_DID_NOT_ADVANCE.
-                    # HubSpot updatedAt has millisecond precision, so distinct
-                    # updates effectively never share the exact boundary value.
+                    # Equal timestamps are common in bulk imports. Drain each
+                    # group before checkpointing past it.
                     if checkpoint:
                         records = [
                             r for r in records
@@ -1646,8 +1872,26 @@ def register_lakeflow_source(spark):
                     )
 
                 if not records:
+                    if incremental and after:
+                        time.sleep(0.1)
+                        continue
                     break
 
+                # Admission control is a soft cap: only stop when the next page
+                # starts after the timestamp already drained. Checking after
+                # consuming this page would skip its unprocessed equal-time peers.
+                if (
+                    incremental
+                    and max_records is not None
+                    and len(all_records) >= max_records
+                    and latest_updated
+                    and (records[0].get("updatedAt") or "") > latest_updated
+                ):
+                    break
+
+                # Neither embedded list responses nor Search establish complete
+                # relationships. Hydrate every selected parent before publishing it.
+                self._hydrate_associations(table_name, records, associations)
                 # Transform records
                 transformed_records = self._transform_records(records, table_name)
                 all_records.extend(transformed_records)
@@ -1661,11 +1905,6 @@ def register_lakeflow_source(spark):
                 if not after:
                     break
 
-                # Stop if we've hit the per-microbatch record cap. The next
-                # microbatch resumes from latest_updated via the cursor filter.
-                if max_records is not None and len(all_records) >= max_records:
-                    break
-
                 # Rate limiting
                 time.sleep(0.1)
 
@@ -1677,6 +1916,19 @@ def register_lakeflow_source(spark):
             offset = {"updatedAt": latest_updated} if latest_updated else {}
             return all_records, offset
 
+        def _hydrate_associations(self, table_name: str, records: List[Dict], targets: List[str]) -> None:
+            if not targets or not records:
+                return
+            from_type = self._get_api_object_type(table_name)
+            parent_ids = [str(record["id"]) for record in records]
+            for target in targets:
+                links = self._associations.read(from_type, self._get_api_object_type(target), parent_ids)
+                for record in records:
+                    record["associations"] = record.get("associations") or {}
+                    record["associations"][target] = {
+                        "results": [{"id": value} for value in links[str(record["id"])]]
+                    }
+
         def _fetch_full_refresh_batch(
             self,
             table_name: str,
@@ -1687,14 +1939,14 @@ def register_lakeflow_source(spark):
         ):
             """Fetch a batch of records using full refresh API"""
             archived_param = "true" if archived else "false"
-            url = f"{self.base_url}/crm/v3/objects/{table_name}?limit=100&archived={archived_param}"
+            api_type = self._get_api_object_type(table_name)
+            url = f"{self.base_url}/crm/objects/2026-09/{api_type}?limit=100&archived={archived_param}"
 
             if after:
                 url += f"&after={after}"
             if property_names:
                 url += f"&properties={','.join(property_names)}"
-            if associations:
-                url += f"&associations={','.join(associations)}"
+            # Relationships are read separately with complete per-parent pagination.
 
             resp = requests.get(url, headers=self.auth_header, timeout=60)
             if resp.status_code != 200:
@@ -1750,7 +2002,8 @@ def register_lakeflow_source(spark):
             if after:
                 search_body["after"] = after
 
-            url = f"{self.base_url}/crm/v3/objects/{table_name}/search"
+            api_type = self._get_api_object_type(table_name)
+            url = f"{self.base_url}/crm/objects/2026-09/{api_type}/search"
             resp = requests.post(url, headers=self.auth_header, json=search_body, timeout=60)
 
             if resp.status_code != 200:
@@ -1832,7 +2085,7 @@ def register_lakeflow_source(spark):
         def test_connection(self) -> dict:
             """Test the connection to HubSpot API"""
             try:
-                url = f"{self.base_url}/crm/v3/objects/contacts?limit=1"
+                url = f"{self.base_url}/crm/objects/2026-09/contacts?limit=1"
                 resp = requests.get(url, headers=self.auth_header, timeout=60)
 
                 if resp.status_code == 200:
