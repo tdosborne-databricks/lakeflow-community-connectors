@@ -390,3 +390,38 @@ def test_pipeline_snapshot_requires_complete_partition_discovery(generated):
         )
         assert [r["objectTypeId"] for r in rows] == ["0-3"]
         assert offset == {}
+
+
+@pytest.mark.parametrize("generated", [False, True])
+def test_unknown_association_object_types_are_skipped_not_fatal(generated):
+    """HubSpot auto-associates a new custom object with internal object types the
+    connector does not model (0-18 communication, 0-4 engagement, ...). Those
+    edges have no destination table, so discovery must skip them rather than
+    fail every table in the pipeline.
+    """
+    schemas = {"results": [{
+        "name": "Cars",
+        "objectTypeId": "2-12345",
+        "associations": [
+            {"fromObjectTypeId": "2-12345", "toObjectTypeId": "0-1"},
+            {"fromObjectTypeId": "0-1", "toObjectTypeId": "2-12345"},
+            {"fromObjectTypeId": "2-12345", "toObjectTypeId": "0-2"},
+            {"fromObjectTypeId": "2-12345", "toObjectTypeId": "0-18"},
+            {"fromObjectTypeId": "0-4", "toObjectTypeId": "2-12345"},
+            {"fromObjectTypeId": "2-12345", "toObjectTypeId": "0-116"},
+        ],
+    }]}
+
+    def get(url, **_kwargs):
+        assert urlparse(url).path == "/crm-object-schemas/2026-09/schemas"
+        return _Response(schemas)
+
+    conn = _connector_class(generated)({"access_token": "test-only-token"})
+    with mock.patch("requests.get", side_effect=get):
+        tables = conn.list_tables()
+    assert "cars" in tables
+    associations = conn._custom_object_configs["cars"]["associations"]
+    assert "contacts" in associations
+    assert "companies" in associations
+    # None of the unmapped internal types leaked an association column in.
+    assert not any(name.startswith(("0-", "2-")) for name in associations)
