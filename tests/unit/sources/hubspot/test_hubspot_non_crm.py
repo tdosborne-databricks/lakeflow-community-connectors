@@ -14,6 +14,7 @@ from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import 
 NON_CRM_TEST_GET = (
     "databricks.labs.community_connector.sources.hubspot.hubspot_non_crm.requests.get"
 )
+EMPTY_LEGACY_CATALOG = {"lists": [], "has-more": False}
 
 
 def page(*rows, after=None):
@@ -32,13 +33,31 @@ def response(data=None, status=200, headers=None):
 def helper(*payloads, custom_types=()):
     post = Mock(side_effect=payloads)
     sleeps = Mock()
-    return HubspotNonCrm("https://example.invalid/", {"Authorization": "fake"},
-                         lambda: list(custom_types), post, sleeps), post, sleeps
+    return (
+        HubspotNonCrm(
+            "https://example.invalid/",
+            {"Authorization": "fake"},
+            lambda: list(custom_types),
+            post,
+            sleeps,
+        ),
+        post,
+        sleeps,
+    )
+
+
+def list_page(*rows, offset=0, has_more=False):
+    return {"lists": list(rows), "offset": offset, "hasMore": has_more, "total": len(rows)}
 
 
 def contact_list(identity="1", **extra):
-    return {"listId": identity, "objectTypeId": "0-1", "processingType": "MANUAL",
-            "processingStatus": "COMPLETE", **extra}
+    return {
+        "listId": identity,
+        "objectTypeId": "0-1",
+        "processingType": "MANUAL",
+        "processingStatus": "COMPLETE",
+        **extra,
+    }
 
 
 @pytest.mark.parametrize("table", ["owners", "forms"])
@@ -46,14 +65,21 @@ def test_partitions_pagination_and_identical_duplicate(table):
     source = {"id": "1", "archived": False, "unknown": {"nested": [1, True]}}
     archived = {"id": "2", "archived": True}
     read, _, _ = helper()
-    with patch(NON_CRM_TEST_GET, side_effect=[
-        response(page(source, after="next")), response(page(source)), response(page(archived)),
-    ]) as get:
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(page(source, after="next")),
+            response(page(source)),
+            response(page(archived)),
+        ],
+    ) as get:
         rows = read.read_table(table, {})
     assert [r["id"] for r in rows] == ["1", "2"]
     assert json.loads(rows[0]["payload"]) == source
     assert [c.kwargs["params"]["archived"] for c in get.call_args_list] == [
-        "false", "false", "true",
+        "false",
+        "false",
+        "true",
     ]
     assert get.call_args_list[1].kwargs["params"]["after"] == "next"
     expected = "/crm/owners/2026-09" if table == "owners" else "/marketing/v3/forms"
@@ -64,51 +90,79 @@ def test_partitions_pagination_and_identical_duplicate(table):
 
 
 def test_lists_post_body_and_body_cursor():
-    read, post, _ = helper(page(contact_list(), after="opaque"), page(contact_list("2")))
-    rows = read.read_table("contact_lists", {})
+    read, post, _ = helper(
+        list_page(contact_list(), offset=1, has_more=True),
+        list_page(contact_list("2")),
+    )
+    with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+        rows = read.read_table("contact_lists", {})
     assert [r["listId"] for r in rows] == ["1", "2"]
+    assert rows[0]["legacyListId"] is None
     first, second = post.call_args_list
     assert first.args == (
-        "non_crm", "https://example.invalid/crm/lists/2026-09/all",
-        {"objectTypeId": "0-1", "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
-         "additionalProperties": [], "count": 500}, 0.11,
+        "non_crm",
+        "https://example.invalid/crm/lists/2026-09/search",
+        {
+            "objectTypeId": "0-1",
+            "processingTypes": ["MANUAL", "DYNAMIC", "SNAPSHOT"],
+            "additionalProperties": [],
+            "count": 500,
+            "offset": 0,
+        },
+        0.11,
     )
-    assert second.args[2] == {**first.args[2], "after": "opaque"}
+    assert second.args[2] == {**first.args[2], "offset": 1}
 
 
 def test_memberships_all_lists_composite_keys_and_full_rescan_removal():
-    inventory = page(contact_list("1"), contact_list("2"))
+    inventory = list_page(contact_list("1"), contact_list("2"))
     read, post, _ = helper(inventory, inventory)
-    with patch(NON_CRM_TEST_GET, side_effect=[
-        response(page({"recordId": 10, "membershipTimestamp": "now"}, after="x")),
-        response(page({"recordId": "20"})), response(page({"recordId": "10"})),
-        response(page()), response(page({"recordId": "10"})),
-    ]) as get:
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(page({"recordId": 10, "membershipTimestamp": "now"}, after="x")),
+            response(page({"recordId": "20"})),
+            response(page({"recordId": "10"})),
+            response(page()),
+            response(page({"recordId": "10"})),
+        ],
+    ) as get:
         first = read.read_table("contact_list_memberships", {})
         second = read.read_table("contact_list_memberships", {})
     assert {(r["listId"], r["recordId"]) for r in first} == {
-        ("1", "10"), ("1", "20"), ("2", "10"),
+        ("1", "10"),
+        ("1", "20"),
+        ("2", "10"),
     }
     assert [(r["listId"], r["recordId"]) for r in second] == [("2", "10")]
-    assert get.call_args_list[1].kwargs["params"] == {"limit": 100, "after": "x"}
+    assert get.call_args_list[1].kwargs["params"] == {"limit": 250, "after": "x"}
     assert get.call_args_list[2].args[0].endswith("/crm/lists/2026-09/2/memberships")
     assert post.call_count == 2
 
 
 def test_submissions_all_forms_pages_and_composite_identity():
-    submission = {"conversionId": "same", "submittedAt": 123,
-                  "values": [{"name": "email", "value": "a@example.invalid", "unknown": 1}],
-                  "unknown": {"keep": True}}
+    submission = {
+        "conversionId": "same",
+        "submittedAt": 123,
+        "values": [{"name": "email", "value": "a@example.invalid", "unknown": 1}],
+        "unknown": {"keep": True},
+    }
     read, _, _ = helper()
-    with patch(NON_CRM_TEST_GET, side_effect=[
-        response(page({"id": "f1"})), response(page({"id": "f2"})),
-        response(page(submission, after="opaque")),
-        response(page({"conversionId": "other", "submittedAt": 124, "values": []})),
-        response(page(submission)),
-    ]) as get:
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(page({"id": "f1"})),
+            response(page({"id": "f2"})),
+            response(page(submission, after="opaque")),
+            response(page({"conversionId": "other", "submittedAt": 124, "values": []})),
+            response(page(submission)),
+        ],
+    ) as get:
         rows = read.read_table("form_submissions", {})
     assert {(r["formId"], r["conversionId"]) for r in rows} == {
-        ("f1", "same"), ("f1", "other"), ("f2", "same"),
+        ("f1", "same"),
+        ("f1", "other"),
+        ("f2", "same"),
     }
     assert json.loads(rows[0]["payload"])["unknown"] == {"keep": True}
     assert rows[0]["values"][0]["value"] == "a@example.invalid"
@@ -119,16 +173,30 @@ def test_submissions_all_forms_pages_and_composite_identity():
 
 
 def test_pipeline_defaults_overrides_and_nested_lossless_payload():
-    source = {"id": "same", "label": "Main", "displayOrder": 1,
-              "stages": [{"id": 7, "label": "Open", "displayOrder": 2,
-                          "metadata": {"probability": "0.5", "unknown": {"a": 1}},
-                          "extra": [1]}], "extra": {"nested": True}}
+    source = {
+        "id": "same",
+        "label": "Main",
+        "displayOrder": 1,
+        "stages": [
+            {
+                "id": 7,
+                "label": "Open",
+                "displayOrder": 2,
+                "metadata": {"probability": "0.5", "unknown": {"a": 1}},
+                "extra": [1],
+            }
+        ],
+        "extra": {"nested": True},
+    }
     read, _, _ = helper(custom_types=["2-9"])
     with patch(NON_CRM_TEST_GET, return_value=response(page(source))) as get:
         rows = read.read_table("pipelines", {})
     assert [r["objectTypeId"] for r in rows] == ["0-3", "0-5", "0-27", "2-9"]
     assert [c.args[0].rsplit("/", 1)[1] for c in get.call_args_list] == [
-        "0-3", "0-5", "0-27", "2-9",
+        "0-3",
+        "0-5",
+        "0-27",
+        "2-9",
     ]
     assert rows[0]["stages"][0]["id"] == "7"
     assert rows[0]["stages"][0]["metadata"]["unknown"] == '{"a":1}'
@@ -141,17 +209,35 @@ def test_pipeline_defaults_overrides_and_nested_lossless_payload():
         read.read_table("pipelines", {"pipeline_object_types": "0-999"})
 
 
-@pytest.mark.parametrize("table,source", [
-    ("owners", {"id": 1, "userId": 2, "userIdIncludingInactive": 3,
-                "teams": [{"id": 4, "name": "Sales", "primary": True}]}),
-    ("forms", {"id": "f", "formType": "future", "configuration": {"a": [1]},
-               "fieldGroups": [{"new": True}]}),
-    ("contact_lists", contact_list(listVersion=3, additionalProperties={"x": "y"})),
-])
+@pytest.mark.parametrize(
+    "table,source",
+    [
+        (
+            "owners",
+            {
+                "id": 1,
+                "userId": 2,
+                "userIdIncludingInactive": 3,
+                "teams": [{"id": 4, "name": "Sales", "primary": True}],
+            },
+        ),
+        (
+            "forms",
+            {
+                "id": "f",
+                "formType": "future",
+                "configuration": {"a": [1]},
+                "fieldGroups": [{"new": True}],
+            },
+        ),
+        ("contact_lists", contact_list(listVersion=3, additionalProperties={"x": "y"})),
+    ],
+)
 def test_consumer_schemas_and_lossless_fields(table, source):
-    read, _, _ = helper(page(source))
+    read, _, _ = helper(list_page(source) if table == "contact_lists" else page(source))
     if table == "contact_lists":
-        rows = read.read_table(table, {})
+        with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+            rows = read.read_table(table, {})
     else:
         with patch(NON_CRM_TEST_GET, side_effect=[response(page(source)), response(page())]):
             rows = read.read_table(table, {})
@@ -161,22 +247,39 @@ def test_consumer_schemas_and_lossless_fields(table, source):
     assert set(rows[0]) == set(read.get_table_schema(table).fieldNames())
 
 
+def routed_get(url, params=None, headers=None, timeout=None):
+    if str(url).endswith("/contacts/v1/lists"):
+        return response(EMPTY_LEGACY_CATALOG)
+    return response(page())
+
+
 @pytest.mark.parametrize("table", HubspotNonCrm.list_tables())
 def test_empty_valid_snapshots_and_metadata(table):
-    read, _, _ = helper(page())
-    with patch(NON_CRM_TEST_GET, return_value=response(page())):
+    payload = list_page() if table in {"contact_lists", "contact_list_memberships"} else page()
+    read, _, _ = helper(payload)
+    with patch(NON_CRM_TEST_GET, side_effect=routed_get):
         assert read.read_table(table, {}) == []
     metadata = read.read_table_metadata(table)
-    assert metadata["ingestion_type"] == "snapshot"
-    assert metadata["cursor_field"] is None
+    if table == "contact_list_memberships":
+        assert metadata["ingestion_type"] == "append"
+        assert metadata["cursor_field"] == "membershipTimestamp"
+    else:
+        assert metadata["ingestion_type"] == "snapshot"
+        assert metadata["cursor_field"] is None
     assert set(metadata["primary_keys"]) <= set(read.get_table_schema(table).fieldNames())
 
 
-@pytest.mark.parametrize("table,id_field", [
-    ("owners", "id"), ("forms", "id"), ("pipelines", "id"),
-    ("contact_lists", "listId"), ("contact_list_memberships", "recordId"),
-    ("form_submissions", "conversionId"),
-])
+@pytest.mark.parametrize(
+    "table,id_field",
+    [
+        ("owners", "id"),
+        ("forms", "id"),
+        ("pipelines", "id"),
+        ("contact_lists", "listId"),
+        ("contact_list_memberships", "recordId"),
+        ("form_submissions", "conversionId"),
+    ],
+)
 @pytest.mark.parametrize("bad", [None, True, "", {}, 1.5])
 def test_required_id_validation(table, id_field, bad):
     read, _, _ = helper()
@@ -209,9 +312,9 @@ def test_malformed_paging(paging):
             read.read_table("owners", {})
 
 
-@pytest.mark.parametrize("cursors", [["a", "a"], ["a", "b", "a"]])
-def test_cursor_cycles(cursors):
-    read, _, _ = helper(*(page(after=c) for c in cursors))
+@pytest.mark.parametrize("offsets", [[2, 2], [2, 3, 2]])
+def test_cursor_cycles(offsets):
+    read, _, _ = helper(*(list_page(offset=n, has_more=True) for n in offsets))
     with pytest.raises(RuntimeError, match="cyclic"):
         read.read_table("contact_lists", {})
 
@@ -219,9 +322,13 @@ def test_cursor_cycles(cursors):
 @pytest.mark.parametrize("status", [403, 404, 500])
 def test_error_after_successful_page_aborts_snapshot_without_body_leak(status):
     read, _, _ = helper()
-    with patch(NON_CRM_TEST_GET, side_effect=[
-        response(page({"id": "a"}, after="next")), response(status=status),
-    ]) as get:
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(page({"id": "a"}, after="next")),
+            response(status=status),
+        ],
+    ) as get:
         with pytest.raises(RuntimeError, match=f"HTTP {status}") as error:
             read.read_table("owners", {})
     assert str(error.value) == f"HubSpot non-CRM HTTP {status}"
@@ -237,11 +344,15 @@ def test_failed_archived_partition_is_not_skipped():
 
 def test_429_retry_after_and_exhaustion():
     read, _, sleep = helper()
-    with patch(NON_CRM_TEST_GET, side_effect=[
-        response(status=429, headers={"Retry-After": "2"}),
-        response(status=429, headers={"Retry-After": "bad"}),
-        response(page()), response(page()),
-    ]) as get:
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(status=429, headers={"Retry-After": "2"}),
+            response(status=429, headers={"Retry-After": "bad"}),
+            response(page()),
+            response(page()),
+        ],
+    ) as get:
         assert read.read_table("owners", {}) == []
     assert get.call_count == 4
     assert sum(c.args == (2.0,) for c in sleep.call_args_list) == 2
@@ -252,7 +363,7 @@ def test_429_retry_after_and_exhaustion():
 
 
 def test_processing_list_cannot_claim_complete_memberships():
-    read, _, _ = helper(page(contact_list(processingStatus="PROCESSING")))
+    read, _, _ = helper(list_page(contact_list(processingStatus="PROCESSING")))
     with patch(NON_CRM_TEST_GET) as get:
         with pytest.raises(RuntimeError, match="PROCESSING"):
             read.read_table("contact_list_memberships", {})
@@ -260,25 +371,36 @@ def test_processing_list_cannot_claim_complete_memberships():
 
 
 def test_post_failure_after_page_and_noncontact_inventory_fail():
-    read, _, _ = helper(page(contact_list(), after="x"), RuntimeError("transport failed"))
+    read, _, _ = helper(
+        list_page(contact_list(), offset=1, has_more=True), RuntimeError("transport failed")
+    )
     with pytest.raises(RuntimeError, match="transport failed"):
         read.read_table("contact_lists", {})
-    read, _, _ = helper(page(contact_list(objectTypeId="0-2")))
+    read, _, _ = helper(list_page(contact_list(objectTypeId="0-2")))
     with pytest.raises(RuntimeError, match="Non-contact"):
         read.read_table("contact_lists", {})
 
 
 def test_conflicting_duplicate_identity_fails():
-    read, _, _ = helper(page(contact_list(name="one"), contact_list(name="two")))
-    with pytest.raises(RuntimeError, match="Conflicting duplicate"):
-        read.read_table("contact_lists", {})
+    read, _, _ = helper(list_page(contact_list(name="one"), contact_list(name="two")))
+    with patch(NON_CRM_TEST_GET, return_value=response(EMPTY_LEGACY_CATALOG)):
+        with pytest.raises(RuntimeError, match="Conflicting duplicate"):
+            read.read_table("contact_lists", {})
 
 
 def test_injected_partition_cannot_overwrite_conflicting_source_identity():
     read, _, _ = helper()
-    with patch(NON_CRM_TEST_GET, return_value=response(page({
-        "id": "p", "objectTypeId": "0-5",
-    }))):
+    with patch(
+        NON_CRM_TEST_GET,
+        return_value=response(
+            page(
+                {
+                    "id": "p",
+                    "objectTypeId": "0-5",
+                }
+            )
+        ),
+    ):
         with pytest.raises(RuntimeError, match="partition identity"):
             read.read_table("pipelines", {"pipeline_object_types": "0-3"})
 
@@ -289,14 +411,111 @@ def test_post_missing_results_is_not_empty_snapshot():
         read.read_table("contact_lists", {})
 
 
+def test_membership_batches_resume_by_list_and_cursor():
+    # Inventory is re-read on every batch. Lists are walked in numeric order,
+    # so list 2 is published before list 10.
+    read, post, _ = helper(
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+        list_page(contact_list("10"), contact_list("2")),
+    )
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response(page({"recordId": "a"}, after="p2")),
+            response(page({"recordId": "b"})),
+            response(page({"recordId": "c"})),
+        ],
+    ) as get:
+        first, after_first = read.read_membership_batch({}, max_records=1)
+        second, after_second = read.read_membership_batch(after_first, max_records=1)
+        third, after_third = read.read_membership_batch(after_second, max_records=1)
+        fourth, after_fourth = read.read_membership_batch(after_third, max_records=1)
+        done, same = read.read_membership_batch(after_fourth, max_records=1)
+    assert [row["recordId"] for row in first] == ["a"]
+    assert after_first == {"membershipListId": "2", "membershipAfter": "p2"}
+    assert [row["recordId"] for row in second] == ["b"]
+    assert after_second == {"membershipListId": "2", "membershipListComplete": True}
+    assert [row["recordId"] for row in third] == ["c"]
+    assert after_third == {"membershipListId": "10", "membershipListComplete": True}
+    assert fourth == [] and after_fourth == {"membershipDone": True}
+    assert done == [] and same == after_fourth
+    assert get.call_args_list[1].kwargs["params"]["after"] == "p2"
+    assert get.call_args_list[2].args[0].endswith("/crm/lists/2026-09/10/memberships")
+    assert post.call_count == 4
+
+
 def test_membership_schema_retains_timestamp_and_unknown_payload():
-    read, _, _ = helper(page(contact_list()))
-    source = {"recordId": 42, "listId": 1,
-              "membershipTimestamp": "2026-10-28T00:00:00Z",
-              "unknown": [1, {"x": True}]}
+    read, _, _ = helper(list_page(contact_list()))
+    source = {
+        "recordId": 42,
+        "listId": 1,
+        "membershipTimestamp": "2026-10-28T00:00:00Z",
+        "unknown": [1, {"x": True}],
+    }
     with patch(NON_CRM_TEST_GET, return_value=response(page(source))):
         rows = read.read_table("contact_list_memberships", {})
     _make_type_verifier(read.get_table_schema("contact_list_memberships"))(rows[0])
     assert rows[0]["recordId"] == "42"
     assert json.loads(rows[0]["payload"]) == source
     assert rows[0]["listId"] == "1"
+
+
+def test_contact_lists_keep_the_v1_list_id():
+    read, post, _ = helper(
+        list_page(contact_list("7856"), contact_list("57")),
+        {
+            "legacyListIdsToIdsMapping": [
+                {"listId": "7856", "legacyListId": "4836"},
+                {"listId": "57", "legacyListId": "16"},
+            ],
+            "missingLegacyListIds": ["999"],
+        },
+    )
+    with patch(
+        NON_CRM_TEST_GET,
+        side_effect=[
+            response({"lists": [{"listId": 4836}], "has-more": True, "offset": 1}),
+            response(
+                {
+                    "lists": [{"listId": "16"}, {"listId": 4836}, {"listId": "999"}],
+                    "has-more": False,
+                }
+            ),
+        ],
+    ):
+        rows = read.read_table("contact_lists", {})
+    assert [(row["listId"], row["legacyListId"]) for row in rows] == [
+        ("7856", "4836"),
+        ("57", "16"),
+    ]
+    assert post.call_args_list[1].args[1].endswith("/crm/lists/2026-09/idmapping")
+    assert post.call_args_list[1].args[2] == ["4836", "16", "999"]
+
+
+def test_sunset_legacy_catalog_leaves_the_list_id_empty():
+    read, post, _ = helper(list_page(contact_list("7856")))
+    with patch(NON_CRM_TEST_GET, return_value=response(status=404)):
+        rows = read.read_table("contact_lists", {})
+    assert rows[0]["legacyListId"] is None
+    assert post.call_count == 1
+
+
+def test_conflicting_legacy_list_id_fails():
+    read, _, _ = helper(
+        list_page(contact_list("7856")),
+        {
+            "legacyListIdsToIdsMapping": [
+                {"listId": "7856", "legacyListId": "1"},
+                {"listId": "7856", "legacyListId": "2"},
+            ],
+            "missingLegacyListIds": [],
+        },
+    )
+    with patch(
+        NON_CRM_TEST_GET,
+        return_value=response({"lists": [{"listId": "1"}, {"listId": "2"}], "has-more": False}),
+    ):
+        with pytest.raises(RuntimeError, match="Conflicting HubSpot legacy list id"):
+            read.read_table("contact_lists", {})

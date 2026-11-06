@@ -237,10 +237,26 @@ def test_429_gives_up_after_max_retries():
 
 def test_non_429_error_is_raised_immediately():
     reader = _reader()
-    with mock.patch.object(hph.requests, "post", return_value=_Resp(500)) as post:
-        with pytest.raises(RuntimeError, match="500"):
+    with mock.patch.object(hph.requests, "post", return_value=_Resp(400)) as post:
+        with pytest.raises(RuntimeError, match="400"):
             reader.read_table("contacts_property_history", {}, {})
     assert post.call_count == 1
+
+
+def test_gateway_errors_retry_then_succeed():
+    sleeps = []
+    reader = _reader(sleeps)
+    responses = [
+        _Resp(502, {"message": "bad gateway"}),
+        _Resp(503, {"message": "unavailable"}),
+        _Resp(200, {"results": []}),
+    ]
+    with mock.patch.object(hph.requests, "post", side_effect=responses) as post:
+        rows, offset = reader.read_table("contacts_property_history", {}, {})
+    assert list(rows) == []
+    assert offset["history_scan"]["complete"] is True
+    assert post.call_count == 3
+    assert any(delay >= 1.0 for delay in sleeps)
 
 
 @pytest.mark.parametrize("status", [200, 207])

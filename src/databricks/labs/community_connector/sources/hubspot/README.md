@@ -64,8 +64,13 @@ The HubSpot connector supports the following CRM objects with dynamic schema dis
 ### Resource snapshots
 
 The following tables use complete snapshot ingestion. Each read drains every
-configured partition and page before returning rows. An HTTP error, malformed
-page, incomplete partition discovery, or conflicting duplicate fails the read.
+configured partition and page before returning rows, except
+`contact_list_memberships`. That table returns at most 100,000 rows per call
+and a synthetic offset (`membershipListId` with HubSpot's `after` cursor,
+`membershipListComplete`, or `membershipDone`). The framework calls again
+until the offset stops changing, and the offset is not a saved incremental
+cursor. An HTTP error, malformed page, incomplete partition discovery, or
+conflicting duplicate fails the read.
 The downstream snapshot consumer reconciles removals after a successful read.
 These tables retain all source fields in a JSON `payload` column alongside typed
 common fields. They do not use `max_records_per_batch` or property filters.
@@ -229,13 +234,16 @@ order. Large archive inventories can therefore increase request volume and
 memory use. Only archives returned within HubSpot's retention are observable;
 hard deletes and expired archives are not guaranteed.
 
-Meetings use complete active snapshots by default. HubSpot rejects archived
-meeting listing with `VALIDATION_ERROR` for `MEETING_EVENT` (`0-47`). Each read
-therefore enumerates the complete current meeting set, even with a saved offset
-or record cap. The snapshot consumer reconciles missing IDs after a successful
-complete read; there is no `meetings_delete` flow. This preserves current-state
-removals without archive timestamps or deleted-meeting history. Meeting reads
-remain snapshots when `association_sync_mode=incremental` is supplied.
+Meetings use complete active snapshots. HubSpot rejects archived meeting
+listing with `VALIDATION_ERROR` for `MEETING_EVENT` (`0-47`). The snapshot
+gateway commits the rows from one read, so `max_records_per_batch` does not
+truncate meetings: stopping after one batch would replace the table with that
+slice. Each page is yielded as it is fetched, and a saved `updatedAt` is not
+an incremental cursor. `meetingSnapshot` is this process's start time. A
+follow-up call in that process returns no rows; a later update walks the
+current active set again and reconciles missing IDs. There is no
+`meetings_delete` flow. Meeting reads remain snapshots when
+`association_sync_mode=incremental` is supplied.
 
 Active snapshots reject empty pages with continuation, repeated cursors,
 malformed records, and duplicate IDs before returning any rows or offset. A

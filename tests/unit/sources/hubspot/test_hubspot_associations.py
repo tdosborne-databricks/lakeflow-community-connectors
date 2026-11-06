@@ -31,6 +31,58 @@ def inputs(post):
     return [call.args[2]["inputs"] for call in post.call_args_list]
 
 
+def test_with_types_keeps_each_association_type_and_blank_label():
+    typed = {
+        "from": {"id": "44003174490"},
+        "to": [
+            {
+                "toObjectId": "10904731704",
+                "associationTypes": [
+                    {"category": "USER_DEFINED", "typeId": 39, "label": ""},
+                    {"category": "USER_DEFINED", "typeId": 78, "label": "Advisor"},
+                ],
+            },
+            {
+                "toObjectId": "12822310948",
+                "associationTypes": [
+                    {"category": "USER_DEFINED", "typeId": 39},
+                    {"category": "USER_DEFINED", "typeId": 186, "label": "WLP Advisor"},
+                ],
+            },
+        ],
+    }
+    helper, _, _ = reader(batch(typed))
+    assert helper.read("deals", "2-20309083", ["44003174490"], with_types=True) == {
+        "44003174490": [
+            {"id": "10904731704", "typeId": 39, "category": "USER_DEFINED", "label": None},
+            {"id": "10904731704", "typeId": 78, "category": "USER_DEFINED", "label": "Advisor"},
+            {"id": "12822310948", "typeId": 39, "category": "USER_DEFINED", "label": None},
+            {
+                "id": "12822310948",
+                "typeId": 186,
+                "category": "USER_DEFINED",
+                "label": "WLP Advisor",
+            },
+        ]
+    }
+
+
+def test_default_read_still_returns_ids_when_types_are_present():
+    typed = {
+        "from": {"id": "44003174490"},
+        "to": [
+            {
+                "toObjectId": "12822310948",
+                "associationTypes": [
+                    {"category": "USER_DEFINED", "typeId": 186, "label": "WLP Advisor"},
+                ],
+            }
+        ],
+    }
+    helper, _, _ = reader(batch(typed))
+    assert helper.read("deals", "2-20309083", ["44003174490"]) == {"44003174490": ["12822310948"]}
+
+
 def test_independent_cursors_reordered_parents_and_duplicate_targets():
     helper, post, sleep = reader(
         batch(result("b", [9], "b1"), result("a", [2, "2", "10"], "a1")),
@@ -38,7 +90,8 @@ def test_independent_cursors_reordered_parents_and_duplicate_targets():
         batch(result("b", ["7"])),
     )
     assert helper.read("contacts", "2-123", ["a", "b"]) == {
-        "a": ["10", "2", "3"], "b": ["7", "8", "9"]
+        "a": ["10", "2", "3"],
+        "b": ["7", "8", "9"],
     }
     assert inputs(post) == [
         [{"id": "a"}, {"id": "b"}],
@@ -108,23 +161,40 @@ def test_rejects_bad_ids(bad, field):
     assert post.call_count == 1
 
 
-@pytest.mark.parametrize("payload", [
-    batch(result("other")), batch(result("a"), result("a")),
-    batch({"from": {"id": "a"}}), batch({"from": {"id": "a"}, "to": None}),
-    batch({"from": {"id": "a"}, "to": [None]}), batch({"from": None, "to": []}),
-    batch(None), {"status": "COMPLETE", "results": None}, [],
-])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        batch(result("other")),
+        batch(result("a"), result("a")),
+        batch({"from": {"id": "a"}}),
+        batch({"from": {"id": "a"}, "to": None}),
+        batch({"from": {"id": "a"}, "to": [None]}),
+        batch({"from": None, "to": []}),
+        batch(None),
+        {"status": "COMPLETE", "results": None},
+        [],
+    ],
+)
 def test_rejects_malformed_and_unrequested_results(payload):
     helper, _, _ = reader(payload)
     with pytest.raises(RuntimeError):
         helper.read("contacts", "companies", ["a"])
 
 
-@pytest.mark.parametrize("paging", [
-    None, [], {"next": None}, {"next": {}}, {"next": {"link": "ignored"}},
-    {"next": {"after": None}}, {"next": {"after": True}},
-    {"next": {"after": ""}}, {"next": {"after": []}},
-])
+@pytest.mark.parametrize(
+    "paging",
+    [
+        None,
+        [],
+        {"next": None},
+        {"next": {}},
+        {"next": {"link": "ignored"}},
+        {"next": {"after": None}},
+        {"next": {"after": True}},
+        {"next": {"after": ""}},
+        {"next": {"after": []}},
+    ],
+)
 def test_rejects_malformed_paging(paging):
     value = result("a")
     value["paging"] = paging
@@ -153,9 +223,11 @@ def test_retry_budget_resets_for_each_legitimate_page():
 
 def test_more_than_1000_parents_are_chunked():
     parents = [str(i) for i in range(2001)]
-    post = Mock(side_effect=lambda _kind, _url, body, _interval: batch(
-        *(result(i["id"], [i["id"]]) for i in reversed(body["inputs"]))
-    ))
+    post = Mock(
+        side_effect=lambda _kind, _url, body, _interval: batch(
+            *(result(i["id"], [i["id"]]) for i in reversed(body["inputs"]))
+        )
+    )
     helper = HubspotAssociations("https://example.invalid", post)
     assert helper.read("contacts", "companies", parents) == {p: [p] for p in parents}
     assert [len(i) for i in inputs(post)] == [1000, 1000, 1]
@@ -183,8 +255,11 @@ def test_history_transport_handles_http_status_separately(http_status):
     )
 
     transport = HubspotPropertyHistory(
-        "https://example.invalid", {}, "2030-01-01T00:00:00Z",
-        lambda _: [], lambda _: "",
+        "https://example.invalid",
+        {},
+        "2030-01-01T00:00:00Z",
+        lambda _: [],
+        lambda _: "",
         sleep=lambda _: None,
     )
     limited = Mock(status_code=429, headers={"Retry-After": "0"})
@@ -203,15 +278,19 @@ def test_history_transport_handles_http_status_separately(http_status):
 def association_class(generated):
     import runpy
     from pathlib import Path
+
     import databricks.labs.community_connector.sources.hubspot.hubspot as source
 
     helper_class = HubspotAssociations
     if generated:
         path = Path(source.__file__).with_name("_generated_hubspot_python_source.py")
         from types import SimpleNamespace
+
         registry = Mock()
         runpy.run_path(str(path))["register_lakeflow_source"](SimpleNamespace(dataSource=registry))
-        connector = registry.register.call_args.args[0]({"access_token": "offline"}).lakeflow_connect
+        connector = registry.register.call_args.args[0](
+            {"access_token": "offline"}
+        ).lakeflow_connect
         helper_class = type(connector._associations)
     return helper_class
 
@@ -231,10 +310,13 @@ def test_exhaustion_diagnostics_are_bounded_and_do_not_expose_payload(generated)
     assert "SECRET_PAYLOAD" not in message and "PRIVATE_ID" not in message
 
 
-@pytest.mark.parametrize("extra", [
-    {"errors": [{"message": "attributable context not guaranteed"}]},
-    {"numErrors": 1},
-])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"errors": [{"message": "attributable context not guaranteed"}]},
+        {"numErrors": 1},
+    ],
+)
 @pytest.mark.parametrize("generated", [False, True])
 def test_complete_with_errors_never_commits_explicit_empty(extra, generated):
     helper, post, _ = reader(*([batch(result("a"), **extra)] * 6), generated=generated)
@@ -243,8 +325,9 @@ def test_complete_with_errors_never_commits_explicit_empty(extra, generated):
     assert post.call_count == 6
 
 
-@pytest.mark.parametrize("extra", [{"errors": "bad"}, {"numErrors": -1},
-                                   {"numErrors": True}, {"numErrors": "1"}])
+@pytest.mark.parametrize(
+    "extra", [{"errors": "bad"}, {"numErrors": -1}, {"numErrors": True}, {"numErrors": "1"}]
+)
 @pytest.mark.parametrize("generated", [False, True])
 def test_malformed_error_envelope_fails_before_returning_empty(extra, generated):
     helper, _, _ = reader(batch(result("a"), **extra), generated=generated)
@@ -254,14 +337,22 @@ def test_malformed_error_envelope_fails_before_returning_empty(extra, generated)
 
 @pytest.mark.parametrize("generated", [False, True])
 def test_exhaustion_reports_only_finite_error_labels(generated):
-    payload = batch(errors=[{
-        "category": "VALIDATION_ERROR",
-        "message": "PRIVATE_MESSAGE",
-        "errors": [{"code": "OBJECT_NOT_FOUND", "context": {"id": "PRIVATE_ID"}}],
-    }, {
-        "category": "PRIVATE_CATEGORY",
-        "errors": [{"code": "PRIVATE_CODE"}, {"code": ["PRIVATE_NESTED"]}],
-    }, {"category": {"value": "PRIVATE_CATEGORY"}}, "PRIVATE_ERROR"], numErrors=4)
+    payload = batch(
+        errors=[
+            {
+                "category": "VALIDATION_ERROR",
+                "message": "PRIVATE_MESSAGE",
+                "errors": [{"code": "OBJECT_NOT_FOUND", "context": {"id": "PRIVATE_ID"}}],
+            },
+            {
+                "category": "PRIVATE_CATEGORY",
+                "errors": [{"code": "PRIVATE_CODE"}, {"code": ["PRIVATE_NESTED"]}],
+            },
+            {"category": {"value": "PRIVATE_CATEGORY"}},
+            "PRIVATE_ERROR",
+        ],
+        numErrors=4,
+    )
     helper, post, _ = reader(*([payload] * 6), generated=generated)
     with pytest.raises(RuntimeError) as raised:
         helper.read("deals", "contacts", ["PRIVATE_ID"])
@@ -287,8 +378,15 @@ def get_page(*ids, after=None):
 @pytest.mark.parametrize("generated", [False, True])
 def test_not_found_reconciles_all_pending_parents_with_independent_gets(generated):
     post = Mock(return_value=missing_objects())
-    get = Mock(side_effect=[get_page("2", after="a+cursor"), get_page("2", "3"),
-                           get_page(after="b_cursor"), get_page(), {"id": "b", "archived": False}])
+    get = Mock(
+        side_effect=[
+            get_page("2", after="a+cursor"),
+            get_page("2", "3"),
+            get_page(after="b_cursor"),
+            get_page(),
+            {"id": "b", "archived": False},
+        ]
+    )
     helper = association_class(generated)("https://example.invalid", post, Mock(), get=get)
     assert helper.read("deals", "contacts", ["a", "b"]) == {"a": ["2", "3"], "b": []}
     assert post.call_count == 6
@@ -300,7 +398,9 @@ def test_not_found_reconciles_all_pending_parents_with_independent_gets(generate
 
 @pytest.mark.parametrize("generated", [False, True])
 def test_get_restarts_at_page_one_and_replaces_previous_batch_targets(generated):
-    post = Mock(side_effect=[batch(result("a", ["stale"], "batch_cursor"))] + [missing_objects()] * 6)
+    post = Mock(
+        side_effect=[batch(result("a", ["stale"], "batch_cursor"))] + [missing_objects()] * 6
+    )
     get = Mock(return_value=get_page("fresh"))
     helper = association_class(generated)("https://example.invalid", post, Mock(), get=get)
     assert helper.read("deals", "contacts", ["a"]) == {"a": ["fresh"]}
@@ -308,40 +408,62 @@ def test_get_restarts_at_page_one_and_replaces_previous_batch_targets(generated)
 
 
 @pytest.mark.parametrize("generated", [False, True])
-@pytest.mark.parametrize("payload", [batch(), batch(errors=[{"category": "MISSING_SCOPES"}], numErrors=1),
-    batch(errors=[{"category": "OBJECT_NOT_FOUND"}], numErrors=2),
-    batch(errors=[{"category": "OBJECT_NOT_FOUND"}]),
-    batch(errors=[{"category": "OBJECT_NOT_FOUND"}, {"category": "UNKNOWN"}], numErrors=2),
-    {"status": "COMPLETE", "errors": [{"category": "OBJECT_NOT_FOUND"}], "numErrors": 1},
-    batch(status="PROCESSING", errors=[{"category": "OBJECT_NOT_FOUND"}], numErrors=1)])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        batch(),
+        batch(errors=[{"category": "MISSING_SCOPES"}], numErrors=1),
+        batch(errors=[{"category": "OBJECT_NOT_FOUND"}], numErrors=2),
+        batch(errors=[{"category": "OBJECT_NOT_FOUND"}]),
+        batch(errors=[{"category": "OBJECT_NOT_FOUND"}, {"category": "UNKNOWN"}], numErrors=2),
+        {"status": "COMPLETE", "errors": [{"category": "OBJECT_NOT_FOUND"}], "numErrors": 1},
+        batch(status="PROCESSING", errors=[{"category": "OBJECT_NOT_FOUND"}], numErrors=1),
+    ],
+)
 def test_get_fallback_rejects_nonqualifying_batches(payload, generated):
     get = Mock()
-    helper = association_class(generated)("https://example.invalid", Mock(return_value=payload),
-                                          Mock(), get=get)
+    helper = association_class(generated)(
+        "https://example.invalid", Mock(return_value=payload), Mock(), get=get
+    )
     with pytest.raises(RuntimeError):
         helper.read("deals", "contacts", ["a"])
     get.assert_not_called()
 
 
 @pytest.mark.parametrize("generated", [False, True])
-@pytest.mark.parametrize("pages", [[{}], [{"results": None}], [{"results": [None]}],
-    [{"results": [{"toObjectId": "2"}]}],
-    [get_page(after="cycle"), get_page(after="cycle")],
-    [{"results": [], "paging": {"next": {}}}],
-    [get_page(), {"id": "wrong", "archived": False}],
-    [get_page(), {"id": "a", "archived": True}],
-    [get_page(), {"id": "a"}]])
+@pytest.mark.parametrize(
+    "pages",
+    [
+        [{}],
+        [{"results": None}],
+        [{"results": [None]}],
+        [{"results": [{"toObjectId": "2"}]}],
+        [get_page(after="cycle"), get_page(after="cycle")],
+        [{"results": [], "paging": {"next": {}}}],
+        [get_page(), {"id": "wrong", "archived": False}],
+        [get_page(), {"id": "a", "archived": True}],
+        [get_page(), {"id": "a"}],
+    ],
+)
 def test_get_reconciliation_rejects_unproven_results(pages, generated):
-    helper = association_class(generated)("https://example.invalid", Mock(return_value=missing_objects()),
-                                          Mock(), get=Mock(side_effect=pages))
+    helper = association_class(generated)(
+        "https://example.invalid",
+        Mock(return_value=missing_objects()),
+        Mock(),
+        get=Mock(side_effect=pages),
+    )
     with pytest.raises(RuntimeError):
         helper.read("deals", "contacts", ["a"])
 
 
 @pytest.mark.parametrize("generated", [False, True])
 def test_get_later_parent_failure_does_not_return_partial_results(generated):
-    helper = association_class(generated)("https://example.invalid", Mock(return_value=missing_objects()),
-        Mock(), get=Mock(side_effect=[get_page("2"), RuntimeError("read failed")]))
+    helper = association_class(generated)(
+        "https://example.invalid",
+        Mock(return_value=missing_objects()),
+        Mock(),
+        get=Mock(side_effect=[get_page("2"), RuntimeError("read failed")]),
+    )
     with pytest.raises(RuntimeError, match="read failed"):
         helper.read("deals", "contacts", ["a", "b"])
 
@@ -349,18 +471,21 @@ def test_get_later_parent_failure_does_not_return_partial_results(generated):
 @pytest.mark.parametrize("generated", [False, True])
 def test_get_path_segments_encoded_and_missing_parent_fails(generated):
     get = Mock(side_effect=[get_page(), RuntimeError("parent unavailable")])
-    helper = association_class(generated)("https://example.invalid", Mock(return_value=missing_objects()),
-                                          Mock(), get=get)
+    helper = association_class(generated)(
+        "https://example.invalid", Mock(return_value=missing_objects()), Mock(), get=get
+    )
     with pytest.raises(RuntimeError, match="parent unavailable"):
         helper.read("2-1", "contacts", ["a/b?x=1"])
     assert "/a%2Fb%3Fx%3D1/associations/contacts" in get.call_args_list[0].args[1]
 
 
 def transport_connector(generated):
+    import runpy
     from pathlib import Path
     from types import SimpleNamespace
-    import runpy
+
     import databricks.labs.community_connector.sources.hubspot.hubspot as source
+
     if not generated:
         return source.HubspotLakeflowConnect({"access_token": "offline"})
     registry = Mock()
@@ -378,7 +503,9 @@ def test_get_transport_429_is_bounded_and_reuses_shared_association_throttle(gen
     success = Mock(status_code=200)
     success.json.return_value = get_page("2")
     with patch("requests.get", side_effect=[limited, success]) as get:
-        assert connector._get_association_page("associations", "https://example.invalid", {}, .11) == get_page("2")
+        assert connector._get_association_page(
+            "associations", "https://example.invalid", {}, 0.11
+        ) == get_page("2")
     assert get.call_count == 2
     connector._history._sleep.assert_called_once_with(30.0)
     assert connector._history._throttle.call_count == 2
@@ -386,7 +513,7 @@ def test_get_transport_429_is_bounded_and_reuses_shared_association_throttle(gen
     connector._history._sleep.reset_mock()
     with patch("requests.get", return_value=limited) as get:
         with pytest.raises(RuntimeError, match="status=429"):
-            connector._get_association_page("associations", "https://example.invalid", {}, .11)
+            connector._get_association_page("associations", "https://example.invalid", {}, 0.11)
     assert get.call_count == 6
     assert connector._history._sleep.call_count == 5
 
@@ -394,16 +521,26 @@ def test_get_transport_429_is_bounded_and_reuses_shared_association_throttle(gen
 @pytest.mark.parametrize("generated", [False, True])
 @pytest.mark.parametrize("failure", [404, 403, 207, "request", "json"])
 def test_get_transport_never_exposes_payload_url_or_chained_exception(generated, failure):
-    import requests
     import traceback
+
+    import requests
+
     connector = transport_connector(generated)
     connector._history._throttle = Mock()
     response = Mock(status_code=failure if isinstance(failure, int) else 200, text="PRIVATE_BODY")
     response.json.side_effect = ValueError("PRIVATE_JSON")
-    with patch("requests.get", **({"side_effect": requests.RequestException("PRIVATE_EXCEPTION")}
-                                if failure == "request" else {"return_value": response})):
+    with patch(
+        "requests.get",
+        **(
+            {"side_effect": requests.RequestException("PRIVATE_EXCEPTION")}
+            if failure == "request"
+            else {"return_value": response}
+        ),
+    ):
         with pytest.raises(RuntimeError) as raised:
-            connector._get_association_page("associations", "https://example.invalid/PRIVATE_ID", {}, .11)
+            connector._get_association_page(
+                "associations", "https://example.invalid/PRIVATE_ID", {}, 0.11
+            )
     assert "PRIVATE" not in str(raised.value)
     assert raised.value.__suppress_context__ or raised.value.__context__ is None
     assert "PRIVATE_EXCEPTION" not in "".join(traceback.format_exception(raised.value))
@@ -413,14 +550,21 @@ def test_get_transport_never_exposes_payload_url_or_chained_exception(generated,
 def test_failed_get_reconciliation_returns_no_connector_rows_or_checkpoint(generated):
     connector = transport_connector(generated)
     connector.list_tables = Mock(return_value=["deals"])
-    connector.read_table_metadata = Mock(return_value={"property_names": [],
-        "cursor_property_field": "hs_lastmodifieddate", "associations": ["contacts"]})
+    connector.read_table_metadata = Mock(
+        return_value={
+            "property_names": [],
+            "cursor_property_field": "hs_lastmodifieddate",
+            "associations": ["contacts"],
+        }
+    )
     records = [{"id": parent, "updatedAt": "2020-01-01T00:00:00Z"} for parent in ["a", "b"]]
     connector._fetch_incremental_batch = Mock(return_value=(records, None, None))
     connector._transform_records = Mock()
     connector._associations._post = Mock(return_value=missing_objects())
     connector._associations._sleep = Mock()
-    connector._associations._get = Mock(side_effect=[get_page("2"), RuntimeError("second parent failed")])
+    connector._associations._get = Mock(
+        side_effect=[get_page("2"), RuntimeError("second parent failed")]
+    )
     start = {"updatedAt": "1970-01-01T00:00:00Z"}
     with pytest.raises(RuntimeError, match="second parent failed"):
         connector.read_table("deals", start, {})
@@ -430,8 +574,10 @@ def test_failed_get_reconciliation_returns_no_connector_rows_or_checkpoint(gener
 
 @pytest.mark.parametrize("generated", [False, True])
 def test_get_reconciliation_preserves_parents_already_completed_by_batch(generated):
-    post = Mock(side_effect=[batch(result("done", ["existing"]), result("a", ["stale"], "batch"))]
-                           + [missing_objects()] * 6)
+    post = Mock(
+        side_effect=[batch(result("done", ["existing"]), result("a", ["stale"], "batch"))]
+        + [missing_objects()] * 6
+    )
     get = Mock(return_value=get_page("fresh"))
     helper = association_class(generated)("https://example.invalid", post, Mock(), get=get)
     assert helper.read("deals", "contacts", ["done", "a"]) == {"done": ["existing"], "a": ["fresh"]}
@@ -440,16 +586,22 @@ def test_get_reconciliation_preserves_parents_already_completed_by_batch(generat
 
 
 @pytest.mark.parametrize("generated", [False, True])
-@pytest.mark.parametrize("extra", [
-    {"status": "error", "errors": [{"category": "MISSING_SCOPES"}]},
-    {"errors": [{"category": "OBJECT_NOT_FOUND"}]}, {"numErrors": 0},
-    {"category": "PRIVATE_CATEGORY"}, {"status": None},
-    {"status": {"private": "value"}},
-])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"status": "error", "errors": [{"category": "MISSING_SCOPES"}]},
+        {"errors": [{"category": "OBJECT_NOT_FOUND"}]},
+        {"numErrors": 0},
+        {"category": "PRIVATE_CATEGORY"},
+        {"status": None},
+        {"status": {"private": "value"}},
+    ],
+)
 def test_empty_get_rejects_error_bearing_parent_confirmation(generated, extra):
     get = Mock(side_effect=[get_page(), {"id": "a", "archived": False, **extra}])
-    helper = association_class(generated)("https://example.invalid", Mock(return_value=missing_objects()),
-                                          Mock(), get=get)
+    helper = association_class(generated)(
+        "https://example.invalid", Mock(return_value=missing_objects()), Mock(), get=get
+    )
     with pytest.raises(RuntimeError, match="parent identity"):
         helper.read("deals", "contacts", ["a"])
 

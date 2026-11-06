@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -10,29 +11,58 @@ from pyspark.sql.types import (
     BooleanType,
     DataType,
     DecimalType,
+    LongType,
     StringType,
     StructField,
     StructType,
 )
 
 from databricks.labs.community_connector.interface import LakeflowConnect
-from databricks.labs.community_connector.sources.hubspot.hubspot_associations import HubspotAssociations
-from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import NON_CRM_TABLES, HubspotNonCrm
+from databricks.labs.community_connector.sources.hubspot.hubspot_associations import (
+    HubspotAssociations,
+)
+from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import (
+    NON_CRM_TABLES,
+    HubspotNonCrm,
+)
 from databricks.labs.community_connector.sources.hubspot.hubspot_property_history import (
     HISTORY_STANDARD_OBJECTS,
     MAX_RETRIES,
     REQUEST_TIMEOUT_S,
+    RETRY_STATUSES,
     HubspotPropertyHistory,
     filter_property_names,
     history_table_name,
     is_history_table,
 )
 
+logger = logging.getLogger(__name__)
+
+# These tables keep association type id, category, and label. The other tables
+# keep an array of target ids. The column type changes, so these pipelines
+# need a full refresh after this lands.
+TYPED_ASSOCIATION_TABLES = frozenset(
+    {
+        "deals",
+        "contacts",
+        "advisors",
+        "providers",
+        "system_ids",
+        "on24",
+    }
+)
+
 
 class HubspotLakeflowConnect(LakeflowConnect):
     _STANDARD_OBJECT_TYPES = {
-        "contacts": "0-1", "companies": "0-2", "deals": "0-3", "tickets": "0-5",
-        "calls": "0-48", "emails": "0-49", "meetings": "0-47", "tasks": "0-27",
+        "contacts": "0-1",
+        "companies": "0-2",
+        "deals": "0-3",
+        "tickets": "0-5",
+        "calls": "0-48",
+        "emails": "0-49",
+        "meetings": "0-47",
+        "tasks": "0-27",
         "notes": "0-46",
     }
 
@@ -61,11 +91,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         # trigger.  Without this, the connector would chase continuously
         # arriving updatedAt timestamps indefinitely.  HubSpot timestamps are
         # ISO 8601 with milliseconds (e.g. "2026-04-23T12:34:56.789Z").
-        self._init_ts = (
-            datetime.now(timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
-            + "Z"
-        )
+        self._init_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
         # Centralized object metadata configuration
         # Meetings reject archived listing; complete active snapshots reconcile removals.
@@ -154,9 +180,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             get_property_names=lambda obj: [
                 p["name"] for p in self._get_object_properties(obj) if p.get("name")
             ],
-            get_cursor_property=lambda obj: self._get_object_config(obj)[
-                "cursor_property_field"
-            ],
+            get_cursor_property=lambda obj: self._get_object_config(obj)["cursor_property_field"],
             get_api_object_type=self._get_api_object_type,
         )
         self._associations = HubspotAssociations(
@@ -181,7 +205,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     return response.json()
                 except ValueError:
                     raise RuntimeError("Malformed HubSpot association GET JSON") from None
-            if response.status_code == 429 and attempt < MAX_RETRIES:
+            if response.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
                 self._history._sleep(self._history._retry_delay(response, attempt))
                 continue
             raise RuntimeError(f"HubSpot association GET failed (status={response.status_code})")
@@ -251,24 +275,40 @@ class HubspotLakeflowConnect(LakeflowConnect):
             object_type, name = schema.get("objectTypeId"), schema.get("name")
             if object_type in self._STANDARD_OBJECT_TYPES.values():
                 continue
-            if not isinstance(object_type, str) or not object_type.startswith("2-") or not isinstance(name, str) or not name:
+            if (
+                not isinstance(object_type, str)
+                or not object_type.startswith("2-")
+                or not isinstance(name, str)
+                or not name
+            ):
                 raise RuntimeError("HubSpot custom schema requires name and objectTypeId")
             alias = name.lower()
-            if alias in self._object_config or alias in NON_CRM_TABLES or alias in custom_types or object_type in names_by_type or is_history_table(alias):
+            if (
+                alias in self._object_config
+                or alias in NON_CRM_TABLES
+                or alias in custom_types
+                or object_type in names_by_type
+                or is_history_table(alias)
+            ):
                 raise RuntimeError("HubSpot custom schema has a conflicting identity")
             custom_types[alias] = object_type
             names_by_type[object_type] = alias
 
-        configs = {name: {**config, "associations": list(config["associations"])} for name, config in self._object_config.items()}
+        configs = {
+            name: {**config, "associations": list(config["associations"])}
+            for name, config in self._object_config.items()
+        }
         # Custom objects do support archived listing (verified live: the
         # `archived=true` object listing returns records with `archived` and
         # `archivedAt`, plus requested properties). Without a delete flow an
         # archived custom record never leaves the destination and keeps looking
         # active, so opt discovered custom objects into deletes.
-        configs.update({
-            name: {**self._default_object_config, "associations": [], "supports_deletes": True}
-            for name in custom_types
-        })
+        configs.update(
+            {
+                name: {**self._default_object_config, "associations": [], "supports_deletes": True}
+                for name in custom_types
+            }
+        )
         reserved = {"id", "createdat", "updatedat", "archived", "properties"}
         # Resolve after collecting every type so custom/custom relationships do
         # not depend on schema order. Definitions are directional, not inferred.
@@ -290,14 +330,15 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     # no table to attach an association column to, so skip the
                     # edge instead of failing discovery for every table.
                     unresolved = [
-                        value for value, resolved in (
+                        value
+                        for value, resolved in (
                             (definition.get("fromObjectTypeId"), source),
                             (definition.get("toObjectTypeId"), target),
-                        ) if resolved is None
+                        )
+                        if resolved is None
                     ]
                     if all(
-                        isinstance(value, str) and value.startswith("0-")
-                        for value in unresolved
+                        isinstance(value, str) and value.startswith("0-") for value in unresolved
                     ):
                         continue
                     # An unresolved custom type means a schema was dropped or the
@@ -307,7 +348,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     raise RuntimeError("HubSpot association column conflicts with a base field")
                 discovered[source].add(target)
         for name, targets in discovered.items():
-            configs[name]["associations"].extend(sorted(targets - set(configs[name]["associations"])))
+            configs[name]["associations"].extend(
+                sorted(targets - set(configs[name]["associations"]))
+            )
         # Commit discovery atomically: failures must not leave a partial graph.
         self._custom_object_types = custom_types
         self._custom_object_configs = {name: configs[name] for name in custom_types}
@@ -323,15 +366,25 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
     def _get_object_config(self, table_name: str) -> Dict:
         """Get configuration for a specific object type"""
-        return self._object_config.get(table_name, self._custom_object_configs.get(table_name, self._default_object_config))
+        return self._object_config.get(
+            table_name, self._custom_object_configs.get(table_name, self._default_object_config)
+        )
 
     # Keep in sync with connector_spec.yaml; envelopes cannot smuggle connection
     # credentials or framework routing keys through the external option allowlist.
-    _TABLE_OPTION_KEYS = frozenset({
-        "max_records_per_batch", "history_properties", "history_since",
-        "history_lookback_minutes", "include_properties", "exclude_properties",
-        "association_sync_mode", "pipeline_object_types",
-    })
+    _TABLE_OPTION_KEYS = frozenset(
+        {
+            "max_records_per_batch",
+            "history_properties",
+            "history_since",
+            "history_lookback_minutes",
+            "include_properties",
+            "exclude_properties",
+            "association_sync_mode",
+            "pipeline_object_types",
+            "associations",
+        }
+    )
 
     @classmethod
     def _parse_table_configs(cls, table_options: Mapping[str, str] | None) -> dict | None:
@@ -339,8 +392,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
         options = dict(table_options or {})
         # Spark's CaseInsensitiveDict iterates lowercased keys. Its dict copy
         # loses case-insensitive lookup, so recognize the envelope explicitly.
-        envelope_keys = [key for key in options if isinstance(key, str)
-                         and key.lower() == "tableconfigs"]
+        envelope_keys = [
+            key for key in options if isinstance(key, str) and key.lower() == "tableconfigs"
+        ]
         if not envelope_keys:
             return None
         if len(envelope_keys) != 1:
@@ -400,9 +454,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             raise ValueError("association_sync_mode must be incremental or full_refresh")
         return mode
 
-    def get_table_schema(
-        self, table_name: str, table_options: Dict[str, str]
-    ) -> StructType:
+    def get_table_schema(self, table_name: str, table_options: Dict[str, str]) -> StructType:
         """
         Fetch the schema of a table.
 
@@ -418,8 +470,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
-                f"Unsupported table: {table_name}. "
-                f"Supported tables are: {supported_tables}"
+                f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
             )
 
         if is_history_table(table_name):
@@ -455,9 +506,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             return None
         return value if value > 0 else None
 
-    def read_table_metadata(
-        self, table_name: str, table_options: Dict[str, str]
-    ) -> dict:
+    def read_table_metadata(self, table_name: str, table_options: Dict[str, str]) -> dict:
         """
         Fetch the metadata of a table.
 
@@ -479,8 +528,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
-                f"Unsupported table: {table_name}. "
-                f"Supported tables are: {supported_tables}"
+                f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
             )
 
         if is_history_table(table_name):
@@ -502,7 +550,32 @@ class HubspotLakeflowConnect(LakeflowConnect):
     def _uses_snapshot(cls, table_name: str, table_options: Dict[str, str] | None) -> bool:
         # HubSpot rejects archived-object paging for MEETING_EVENT (0-47).
         # Complete active snapshots preserve current-state removal reconciliation.
-        return table_name == "meetings" or cls._association_sync_mode(table_options) == "full_refresh"
+        return (
+            table_name == "meetings" or cls._association_sync_mode(table_options) == "full_refresh"
+        )
+
+    def _selected_associations(
+        self, table_name: str, table_options: Dict[str, str] | None
+    ) -> List[str]:
+        """Use the associations option when set. A missing key keeps discovery.
+
+        A comma-separated list replaces discovered targets, including custom
+        objects. An empty string hydrates none.
+        """
+        discovered = list(self._get_object_config(table_name).get("associations") or [])
+        if table_options is None or "associations" not in table_options:
+            return discovered
+        raw = table_options.get("associations")
+        if not isinstance(raw, str):
+            raise ValueError("associations must be a comma-separated string")
+        selected, seen = [], set()
+        for part in raw.split(","):
+            name = part.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            selected.append(name)
+        return selected
 
     @classmethod
     def _options_cache_key(cls, table_name: str, table_options: Dict[str, str] | None) -> tuple:
@@ -512,6 +585,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             table_name,
             opts.get("include_properties"),
             opts.get("exclude_properties"),
+            opts.get("associations"),
             cls._association_sync_mode(opts),
         )
 
@@ -559,7 +633,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             "cursor_field": config["cursor_field"],
             "cursor_property_field": config["cursor_property_field"],
             "property_names": property_names,
-            "associations": config.get("associations", []),
+            "associations": self._selected_associations(table_name, table_options),
             "ingestion_type": ingestion_type,
         }
 
@@ -588,9 +662,15 @@ class HubspotLakeflowConnect(LakeflowConnect):
             StructField("archived", BooleanType(), True),
         ]
 
-        # Add association fields based on configuration
+        # Add association fields based on configuration. The six typed tables
+        # store one struct per association type. Everyone else stores ids.
+        association_type = (
+            self._typed_association_type()
+            if table_name in TYPED_ASSOCIATION_TABLES
+            else ArrayType(StringType(), True)
+        )
         for association in config["associations"]:
-            base_fields.append(StructField(association, ArrayType(StringType()), True))
+            base_fields.append(StructField(association, association_type, True))
 
         # Build nested properties schema based on API response
         properties_fields = []
@@ -642,9 +722,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
             # Re-raise (don't return an error dict): callers iterate this as a
             # list of property dicts, so a dict here turns a real API error into
             # an unrelated TypeError far downstream.
-            raise RuntimeError(
-                f"Failed to get object properties for {object_type}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to get object properties for {object_type}: {e}") from e
 
     def _map_hubspot_type_to_spark(self, hubspot_type: str) -> DataType:
         """
@@ -681,25 +759,44 @@ class HubspotLakeflowConnect(LakeflowConnect):
             Tuple of (records, new_offset)
         """
         table_options = self._resolve_table_options(table_name, table_options)
+        if table_name == "contact_list_memberships":
+            # Publish one batch and the resume offset. The full member set is
+            # about 3.2 million rows; returning it from one call fails the
+            # ingestion publish. The next call continues from this offset.
+            batch, offset = self._non_crm.read_membership_batch(start_offset)
+            return iter(batch), offset
         if table_name in NON_CRM_TABLES:
             return iter(self._non_crm.read_table(table_name, table_options)), {}
         supported_tables = self.list_tables()
         if table_name not in supported_tables:
             raise ValueError(
-                f"Unsupported table: {table_name}. "
-                f"Supported tables are: {supported_tables}"
+                f"Unsupported table: {table_name}. Supported tables are: {supported_tables}"
             )
 
         if is_history_table(table_name):
             return self._history.read_table(table_name, start_offset, table_options)
 
-        # Determine if this is an incremental read
-        is_incremental = (
-            start_offset is not None and start_offset.get("updatedAt") is not None
-        )
+        start_offset = dict(start_offset or {})
+        # The snapshot gateway commits one read. A record cap would make that
+        # partial page the whole table. Yield each page instead, and ignore a
+        # saved cursor. The same process's follow-up call stops; a later
+        # update has a new start time and walks the active set again.
+        if table_name == "meetings":
+            if start_offset.get("meetingSnapshot") == self._init_ts:
+                return iter(()), start_offset
+            return (
+                self._iter_meeting_snapshot(table_name, table_options),
+                {"meetingSnapshot": self._init_ts},
+            )
+        # snapshotAfter means the first objects-API scan is unfinished.
+        # association full_refresh stays one complete snapshot.
         if self._uses_snapshot(table_name, table_options):
             is_incremental = False
             start_offset = {}
+        else:
+            is_incremental = start_offset.get("updatedAt") is not None and not start_offset.get(
+                "snapshotAfter"
+            )
 
         return self._read_data(
             table_name,
@@ -751,7 +848,11 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 if not isinstance(record, dict) or record.get("archived") is not True:
                     raise RuntimeError("Malformed HubSpot archive record")
                 raw_id = record.get("id")
-                if isinstance(raw_id, bool) or not isinstance(raw_id, (str, int)) or not str(raw_id).strip():
+                if (
+                    isinstance(raw_id, bool)
+                    or not isinstance(raw_id, (str, int))
+                    or not str(raw_id).strip()
+                ):
                     raise RuntimeError("Malformed HubSpot archive identity")
                 identity = str(raw_id)
                 archived = self._archive_time(record.get("archivedAt"))
@@ -762,8 +863,12 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 seen_ids[identity] = record
                 if archived > upper or (checkpoint is not None and archived <= checkpoint):
                     continue
-                row = self._transform_single_record({**record, "id": identity}, table_name, properties)
-                row["updatedAt"] = archived.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                row = self._transform_single_record(
+                    {**record, "id": identity}, table_name, properties
+                )
+                row["updatedAt"] = archived.isoformat(timespec="milliseconds").replace(
+                    "+00:00", "Z"
+                )
                 rows.append(row)
             if next_after is None:
                 break
@@ -774,19 +879,83 @@ class HubspotLakeflowConnect(LakeflowConnect):
             time.sleep(0.1)
         return iter(rows), {"updatedAt": self._init_ts}
 
+    def _iter_meeting_snapshot(self, table_name: str, table_options: Dict[str, str]):
+        """Yield active meetings one page at a time.
+
+        Snapshot ingestion commits the rows from a single read. Stopping at
+        max_records_per_batch would publish that slice as the entire table.
+        """
+        metadata = self.read_table_metadata(table_name, table_options)
+        property_names = metadata.get("property_names", [])
+        associations = metadata.get("associations", [])
+        after = None
+        seen_ids, seen_cursors = set(), set()
+        pages = 0
+        kept = 0
+        logger.warning(
+            "HUBSPOT_READ table=%s meeting_pages=true associations=%s",
+            table_name,
+            ",".join(associations),
+        )
+        while True:
+            records, after = self._fetch_full_refresh_batch(
+                table_name, property_names, associations, after, archived=False
+            )
+            if not records and after is not None:
+                raise RuntimeError("Empty HubSpot snapshot page has pagination")
+            if after is not None:
+                cursor = str(after)
+                if cursor in seen_cursors:
+                    raise RuntimeError("HubSpot snapshot pagination cursor repeated")
+                seen_cursors.add(cursor)
+            for record in records:
+                if not isinstance(record, dict):
+                    raise RuntimeError("Malformed HubSpot snapshot record")
+                identity = record.get("id")
+                if (
+                    isinstance(identity, bool)
+                    or not isinstance(identity, (str, int))
+                    or not str(identity).strip()
+                    or record.get("archived", False) is not False
+                ):
+                    raise RuntimeError("Malformed HubSpot active snapshot identity")
+                identity = str(identity)
+                if identity in seen_ids:
+                    raise RuntimeError("Duplicate HubSpot snapshot identity")
+                seen_ids.add(identity)
+            if not records:
+                break
+            self._hydrate_associations(table_name, records, associations)
+            transformed = self._transform_records(records, table_name, property_names)
+            yield from transformed
+            kept += len(transformed)
+            pages += 1
+            if pages == 1 or pages % 5 == 0:
+                logger.warning(
+                    "HUBSPOT_READ_PROGRESS table=%s page=%s page_rows=%s kept=%s after=%s",
+                    table_name,
+                    pages,
+                    len(transformed),
+                    kept,
+                    after,
+                )
+            if after is None:
+                break
+            time.sleep(0.1)
+        logger.warning("HUBSPOT_READ_DONE table=%s kept=%s meeting_pages=true", table_name, kept)
+
     def _read_data(
-        self, table_name: str, start_offset: dict = None, incremental: bool = False,
-        table_options: Dict[str, str] = None
+        self,
+        table_name: str,
+        start_offset: dict = None,
+        incremental: bool = False,
+        table_options: Dict[str, str] = None,
     ):
         """Read active (non-archived) data from HubSpot API"""
 
         # Short-circuit once the cursor has caught up to the init-time cap,
         # so Trigger.AvailableNow can terminate.
-        if (
-            incremental
-            and start_offset
-            and start_offset.get("updatedAt", "") >= self._init_ts
-        ):
+        if incremental and start_offset and start_offset.get("updatedAt", "") >= self._init_ts:
             return [], start_offset
 
         # Get discovered properties and object configuration
@@ -794,16 +963,34 @@ class HubspotLakeflowConnect(LakeflowConnect):
         property_names = metadata.get("property_names", [])
         cursor_property_field = metadata.get("cursor_property_field")
         associations = metadata.get("associations", [])
-
-        # Only cap on the incremental path — full-refresh snapshots need
-        # to drain everything in a single call to keep the snapshot atomic.
-        max_records = self._parse_max_records(table_options) if incremental else None
+        uses_snapshot = self._uses_snapshot(table_name, table_options)
+        # Cap the first objects-API scan and checkpoint HubSpot's page cursor.
+        # Association full_refresh still drains every page. Meetings do not use
+        # this path; the snapshot gateway commits a single read.
+        bounded_snapshot = not incremental and not uses_snapshot
+        max_records = (
+            self._parse_max_records(table_options) if incremental or bounded_snapshot else None
+        )
 
         all_records = []
         snapshot_ids, snapshot_cursors = set(), set()
         after = None
+        if bounded_snapshot and start_offset and start_offset.get("snapshotAfter"):
+            after = str(start_offset.get("snapshotAfter"))
         checkpoint = start_offset.get("updatedAt") if start_offset else None
         latest_updated = checkpoint
+        pages = 0
+        logger.warning(
+            "HUBSPOT_READ table=%s incremental=%s bounded_snapshot=%s max_records=%s "
+            "associations=%s option=%s resume_after=%s",
+            table_name,
+            incremental,
+            bounded_snapshot,
+            max_records,
+            ",".join(associations),
+            (table_options or {}).get("associations", "<unset>"),
+            after,
+        )
 
         while True:
             if incremental:
@@ -824,10 +1011,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 # Equal timestamps are common in bulk imports. Drain each
                 # group before checkpointing past it.
                 if checkpoint:
-                    records = [
-                        r for r in records
-                        if (r.get("updatedAt") or "") > checkpoint
-                    ]
+                    records = [r for r in records if (r.get("updatedAt") or "") > checkpoint]
             else:
                 # Use objects API for full refresh
                 records, after = self._fetch_full_refresh_batch(
@@ -846,8 +1030,12 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     if not isinstance(record, dict):
                         raise RuntimeError("Malformed HubSpot snapshot record")
                     identity = record.get("id")
-                    if (isinstance(identity, bool) or not isinstance(identity, (str, int))
-                            or not str(identity).strip() or record.get("archived", False) is not False):
+                    if (
+                        isinstance(identity, bool)
+                        or not isinstance(identity, (str, int))
+                        or not str(identity).strip()
+                        or record.get("archived", False) is not False
+                    ):
                         raise RuntimeError("Malformed HubSpot active snapshot identity")
                     identity = str(identity)
                     if identity in snapshot_ids:
@@ -885,6 +1073,34 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 if updated_at and (not latest_updated or updated_at > latest_updated):
                     latest_updated = updated_at
 
+            pages += 1
+            if bounded_snapshot and (pages == 1 or pages % 5 == 0):
+                logger.warning(
+                    "HUBSPOT_READ_PROGRESS table=%s page=%s page_rows=%s kept=%s after=%s",
+                    table_name,
+                    pages,
+                    len(transformed_records),
+                    len(all_records),
+                    after,
+                )
+            if (
+                bounded_snapshot
+                and max_records is not None
+                and len(all_records) >= max_records
+                and after is not None
+            ):
+                logger.warning(
+                    "HUBSPOT_READ_CHECKPOINT table=%s kept=%s snapshotAfter=%s updatedAt=%s",
+                    table_name,
+                    len(all_records),
+                    after,
+                    latest_updated,
+                )
+                offset = {"snapshotAfter": str(after)}
+                if latest_updated:
+                    offset["updatedAt"] = latest_updated
+                return all_records, offset
+
             if after is None:
                 break
 
@@ -892,25 +1108,51 @@ class HubspotLakeflowConnect(LakeflowConnect):
             time.sleep(0.1)
 
         # Cap the returned cursor at the init-time bound so the next call
-        # eventually short-circuits.
-        if incremental and latest_updated and latest_updated > self._init_ts:
+        # eventually short-circuits. A finished snapshot hands off the same way.
+        if (incremental or bounded_snapshot) and latest_updated and latest_updated > self._init_ts:
             latest_updated = self._init_ts
 
         offset = {"updatedAt": latest_updated} if latest_updated else {}
+        logger.warning(
+            "HUBSPOT_READ_DONE table=%s kept=%s updatedAt=%s",
+            table_name,
+            len(all_records),
+            offset.get("updatedAt"),
+        )
         return all_records, offset
 
-    def _hydrate_associations(self, table_name: str, records: List[Dict], targets: List[str]) -> None:
+    def _hydrate_associations(
+        self, table_name: str, records: List[Dict], targets: List[str]
+    ) -> None:
         if not targets or not records:
             return
         from_type = self._get_api_object_type(table_name)
         parent_ids = [str(record["id"]) for record in records]
+        keep_types = table_name in TYPED_ASSOCIATION_TABLES
+        read_options = {"with_types": True} if keep_types else {}
         for target in targets:
-            links = self._associations.read(from_type, self._get_api_object_type(target), parent_ids)
+            links = self._associations.read(
+                from_type,
+                self._get_api_object_type(target),
+                parent_ids,
+                **read_options,
+            )
             for record in records:
                 record["associations"] = record.get("associations") or {}
-                record["associations"][target] = {
-                    "results": [{"id": value} for value in links[str(record["id"])]]
-                }
+                parent = str(record["id"])
+                if keep_types:
+                    results = [
+                        {
+                            "id": edge["id"],
+                            "typeId": edge["typeId"],
+                            "category": edge["category"],
+                            "label": edge["label"],
+                        }
+                        for edge in links[parent]
+                    ]
+                else:
+                    results = [{"id": value} for value in links[parent]]
+                record["associations"][target] = {"results": results}
 
     def _fetch_full_refresh_batch(
         self,
@@ -933,15 +1175,14 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         resp = requests.get(url, headers=self.auth_header, timeout=60)
         if resp.status_code != 200:
-            raise Exception(
-                f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
-            )
+            raise Exception(f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}")
 
         data = resp.json()
         if not isinstance(data, dict) or not isinstance(data.get("results"), list):
             raise RuntimeError("Malformed HubSpot object results")
-        if (any(key in data for key in ("errors", "numErrors", "category"))
-                or ("status" in data and data["status"] not in ("success", "SUCCESS"))):
+        if any(key in data for key in ("errors", "numErrors", "category")) or (
+            "status" in data and data["status"] not in ("success", "SUCCESS")
+        ):
             raise RuntimeError("HubSpot object response contains an error envelope")
         records = data["results"]
         paging = data.get("paging", {})
@@ -953,7 +1194,11 @@ class HubspotLakeflowConnect(LakeflowConnect):
             if not isinstance(nxt, dict) or "after" not in nxt:
                 raise RuntimeError("Malformed HubSpot object pagination cursor")
             next_after = nxt["after"]
-            if isinstance(next_after, bool) or not isinstance(next_after, (str, int)) or not str(next_after):
+            if (
+                isinstance(next_after, bool)
+                or not isinstance(next_after, (str, int))
+                or not str(next_after)
+            ):
                 raise RuntimeError("Malformed HubSpot object pagination cursor")
 
         return records, next_after
@@ -972,8 +1217,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         # Convert to milliseconds for HubSpot
         try:
             last_updated_ms = int(
-                datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp()
-                * 1000
+                datetime.fromisoformat(last_updated.replace("Z", "+00:00")).timestamp() * 1000
             )
         except ValueError:
             last_updated_ms = 0
@@ -990,9 +1234,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                     ]
                 }
             ],
-            "sorts": [
-                {"propertyName": cursor_property_field, "direction": "ASCENDING"}
-            ],
+            "sorts": [{"propertyName": cursor_property_field, "direction": "ASCENDING"}],
             "limit": 100,
             "properties": property_names or [],
         }
@@ -1005,9 +1247,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         resp = requests.post(url, headers=self.auth_header, json=search_body, timeout=60)
 
         if resp.status_code != 200:
-            raise Exception(
-                f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}"
-            )
+            raise Exception(f"HubSpot API error for {table_name}: {resp.status_code} {resp.text}")
 
         data = resp.json()
         records = data.get("results", [])
@@ -1022,9 +1262,13 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
         return records, next_after, latest_in_batch
 
-    def _transform_records(self, records: List[Dict], table_name: str, property_names=None) -> List[Dict]:
+    def _transform_records(
+        self, records: List[Dict], table_name: str, property_names=None
+    ) -> List[Dict]:
         """Transform HubSpot records by flattening properties and associations"""
-        return [self._transform_single_record(record, table_name, property_names) for record in records]
+        return [
+            self._transform_single_record(record, table_name, property_names) for record in records
+        ]
 
     def _transform_single_record(self, record: Dict, table_name: str, property_names=None) -> Dict:
         """Transform a single HubSpot record"""
@@ -1038,7 +1282,9 @@ class HubspotLakeflowConnect(LakeflowConnect):
         # Copy properties with empty string to None conversion
         # HubSpot API returns "" for null values in many fields
         if "properties" in record:
-            transformed_record["properties"] = self._sanitize_properties(record["properties"], table_name, property_names)
+            transformed_record["properties"] = self._sanitize_properties(
+                record["properties"], table_name, property_names
+            )
 
         # Handle associations
         transformed_record.update(self._extract_associations(record, table_name))
@@ -1047,25 +1293,51 @@ class HubspotLakeflowConnect(LakeflowConnect):
 
     @staticmethod
     def _decimal_property(value):
-        """Reject values which Spark decimal(38,18) would round or overflow."""
+        """Fit a HubSpot number into decimal(38,18).
+
+        Exact values such as 199.12 are kept. A value with more than 18
+        decimal places is binary-float noise (0.1 stored as a 50-digit tail).
+        Those are read back through float so the stored value is the shortest
+        decimal, 0.1. Integers with more than 20 digits still fail.
+        """
         try:
             number = Decimal(str(value))
         except InvalidOperation as exc:
             raise ValueError("Invalid HubSpot numeric property") from exc
         if not number.is_finite():
             raise ValueError("Nonfinite HubSpot numeric property")
-        if number == 0:
+
+        def pack(candidate):
+            if candidate == 0:
+                return Decimal(0)
+            sign, digits, exponent = candidate.as_tuple()
+            digits = list(digits)
+            while digits and digits[-1] == 0:
+                digits.pop()
+                exponent += 1
+            if not digits:
+                return Decimal(0)
+            scale = max(-exponent, 0)
+            integer_digits = max(len(digits) + exponent, 0)
+            return sign, digits, exponent, scale, integer_digits
+
+        packed = pack(number)
+        if packed == Decimal(0):
             return Decimal(0)
-        sign, digits, exponent = number.as_tuple()
-        digits = list(digits)
-        while digits[-1] == 0:
-            digits.pop()
-            exponent += 1
-        if max(-exponent, 0) > 18 or max(len(digits) + exponent, 0) > 20:
+        sign, digits, exponent, scale, integer_digits = packed
+        if scale > 18:
+            number = Decimal(str(float(number)))
+            packed = pack(number)
+            if packed == Decimal(0):
+                return Decimal(0)
+            sign, digits, exponent, scale, integer_digits = packed
+        if scale > 18 or integer_digits > 20:
             raise ValueError("HubSpot numeric property exceeds decimal(38,18)")
         return Decimal((sign, tuple(digits), exponent))
 
-    def _sanitize_properties(self, properties: Dict, table_name: str = None, property_names=None) -> Dict:
+    def _sanitize_properties(
+        self, properties: Dict, table_name: str = None, property_names=None
+    ) -> Dict:
         """Normalize HubSpot nulls and preserve representable numeric values."""
         if not properties:
             return properties
@@ -1080,21 +1352,36 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 output[name] = value
         return output
 
+    @staticmethod
+    def _typed_association_type() -> ArrayType:
+        return ArrayType(
+            StructType(
+                [
+                    StructField("id", StringType(), True),
+                    StructField("typeId", LongType(), True),
+                    StructField("category", StringType(), True),
+                    StructField("label", StringType(), True),
+                ]
+            ),
+            True,
+        )
+
     def _extract_associations(self, record: Dict, table_name: str) -> Dict:
-        """Extract association IDs from record"""
+        """Extract associations. Six tables keep type id, category, and label."""
         associations_data = record.get("associations", {})
         config = self._get_object_config(table_name)
         expected_associations = config["associations"]
+        keep_types = table_name in TYPED_ASSOCIATION_TABLES
         result = {}
 
         for association_type in expected_associations:
             association_list = []
             if association_type in associations_data:
                 assoc_data = associations_data[association_type]
-                if isinstance(assoc_data, dict) and "results" in assoc_data:
-                    association_list = [
-                        item.get("id", "") for item in assoc_data["results"]
-                    ]
+                if keep_types:
+                    association_list = self._typed_association_values(assoc_data)
+                elif isinstance(assoc_data, dict) and "results" in assoc_data:
+                    association_list = [item.get("id", "") for item in assoc_data["results"]]
                 elif isinstance(assoc_data, list):
                     association_list = [
                         str(item) if not isinstance(item, dict) else item.get("id", "")
@@ -1104,6 +1391,29 @@ class HubspotLakeflowConnect(LakeflowConnect):
             result[association_type] = association_list
 
         return result
+
+    @staticmethod
+    def _typed_association_values(assoc_data) -> list:
+        if isinstance(assoc_data, dict) and isinstance(assoc_data.get("results"), list):
+            items = assoc_data["results"]
+        elif isinstance(assoc_data, list):
+            items = assoc_data
+        else:
+            items = []
+        values = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            values.append(
+                {
+                    "id": "" if item.get("id") is None else str(item.get("id")),
+                    "typeId": item.get("typeId"),
+                    "category": item.get("category"),
+                    "label": None if label in (None, "") else label,
+                }
+            )
+        return values
 
     def test_connection(self) -> dict:
         """Test the connection to HubSpot API"""

@@ -65,6 +65,7 @@ BATCH_MIN_INTERVAL_S = 0.1
 
 # 429 handling
 MAX_RETRIES = 5
+RETRY_STATUSES = frozenset({429, 500, 502, 503})
 MAX_BACKOFF_S = 30.0
 REQUEST_TIMEOUT_S = 60
 
@@ -505,7 +506,7 @@ class HubspotPropertyHistory:  # pylint: disable=too-many-instance-attributes
             # Batch read returns 207 when some IDs fail (e.g. deleted mid-run).
             if resp.status_code in (200, 207):
                 return resp.json()
-            if resp.status_code == 429 and attempt < MAX_RETRIES:
+            if resp.status_code in RETRY_STATUSES and attempt < MAX_RETRIES:
                 self._sleep(self._retry_delay(resp, attempt))
                 continue
             raise RuntimeError(

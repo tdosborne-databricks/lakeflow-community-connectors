@@ -242,7 +242,7 @@ requests (Airbyte-style) is a possible follow-up.
 | `pipelines` | `GET /crm/pipelines/2026-09/{objectTypeId}` | `paging.next.after`, every configured object partition |
 | `forms` | `GET /marketing/v3/forms` | `paging.next.after`, active and archived partitions, `formTypes=all` |
 | `contact_lists` | `POST /crm/lists/2026-09/all` | `paging.next.after` passed as `after` in the next request body |
-| `contact_list_memberships` | `GET /crm/lists/2026-09/{listId}/memberships` | `paging.next.after` for each discovered contact list |
+| `contact_list_memberships` | `GET /crm/lists/2026-09/{listId}/memberships` | `paging.next.after` for each discovered contact list, at most 100,000 rows per call |
 | `form_submissions` | `GET /form-integrations/v1/submissions/forms/{formId}` | `paging.next.after` for each discovered form |
 
 Forms intentionally use the supported marketing v3 and submissions v1 endpoints.
