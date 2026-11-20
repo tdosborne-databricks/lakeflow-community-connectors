@@ -55,7 +55,7 @@ discovery and incremental or snapshot synchronization:
 | `tasks` | `id` | `updatedAt` | contacts, companies, deals, tickets |
 | `notes` | `id` | `updatedAt` | contacts, companies, deals, tickets |
 
-> **Note**: Table names are case-sensitive. Use the exact lowercase names shown above. Custom objects are discovered automatically.
+> **Note**: Table names are case-sensitive. Use the exact lowercase names shown above. Custom objects are discovered automatically. `contacts`, `companies`, `deals`, `tickets`, and each custom object also have a `{object}_property_history` table.
 
 ### Resource snapshots
 
@@ -317,6 +317,9 @@ Python interface still receives these values as its `table_options` map.
 | `pipeline_object_types` | `pipelines` | deals, tickets, tasks, discovered custom types | Comma-separated canonical object type IDs. Replaces the default partition inventory; each configured partition must succeed. |
 | `include_properties` | CRM object tables | all properties | Comma-separated allowlist of properties to ingest. Unknown names are ignored. The object's cursor property is always retained. |
 | `exclude_properties` | CRM object tables | none | Comma-separated list of properties to drop after `include_properties` is applied. |
+| `history_properties` | `{object}_property_history` | all discovered properties | Comma-separated property names whose history is requested, such as `dealstage`. |
+| `history_since` | `{object}_property_history` | none | ISO-8601 timestamp. Older history entries are dropped. |
+| `history_lookback_minutes` | `{object}_property_history` | `10` | Minutes subtracted from the saved watermark when a new history scan starts. Set to `0` to disable. |
 
 Two operational notes:
 

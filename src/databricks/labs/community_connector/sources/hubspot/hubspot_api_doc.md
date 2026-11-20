@@ -113,6 +113,31 @@ The optional `association_sync_mode=full_refresh` returns snapshot metadata and
 performs a complete parent/association scan each update; the default incremental
 mode covers only parents selected by Search.
 
+## Property history (`{object}_property_history`)
+
+`contacts_property_history`, `companies_property_history`, `deals_property_history`,
+`tickets_property_history`, and one table per custom object. Search does not
+return `propertiesWithHistory`. The reader searches a frozen parent window,
+then:
+
+```
+POST /crm/objects/2026-09/{objectType}/batch/read
+```
+
+```json
+{
+  "propertiesWithHistory": ["dealstage"],
+  "properties": [],
+  "inputs": [{"id": "123"}]
+}
+```
+
+Each history entry becomes one row keyed by `object_id`, `property`, and
+`timestamp`. `history_properties` chooses which properties to request.
+`history_since` drops older entries. `history_lookback_minutes` replays
+late-indexed parents. HubSpot returns only the recent versions of each
+property.
+
 ## Search API request shape
 
 Incremental reads use the search API with a filter on the property-level
