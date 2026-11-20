@@ -24,6 +24,12 @@ from databricks.labs.community_connector.sources.hubspot.hubspot_non_crm import 
     NON_CRM_TABLES,
     HubspotNonCrm,
 )
+from databricks.labs.community_connector.sources.hubspot.hubspot_property_history import (
+    HISTORY_STANDARD_OBJECTS,
+    HubspotPropertyHistory,
+    history_table_name,
+    is_history_table,
+)
 
 
 def _parse_property_list(raw: str | None) -> List[str] | None:
@@ -166,6 +172,18 @@ class HubspotLakeflowConnect(LakeflowConnect):
         }
 
         self._http = HubspotHttpClient(self.auth_header)
+        # {object}_property_history tables (see hubspot_property_history.py)
+        self._history = HubspotPropertyHistory(
+            base_url=self.base_url,
+            auth_header=self.auth_header,
+            init_ts=self._init_ts,
+            get_property_names=lambda obj: [
+                prop["name"] for prop in self._get_object_properties(obj) if prop.get("name")
+            ],
+            get_cursor_property=lambda obj: self._get_object_config(obj)["cursor_property_field"],
+            get_api_object_type=self._get_api_object_type,
+            http=self._http,
+        )
         self._associations = HubspotAssociations(
             self.base_url, self._post_read, get=self._get_association_page
         )
@@ -234,8 +252,10 @@ class HubspotLakeflowConnect(LakeflowConnect):
         # Add dynamic discovery of custom objects
         custom_objects = self._discover_custom_objects()
         standard_tables.extend(custom_objects)
-
-        return standard_tables + self._non_crm.list_tables()
+        history_tables = [
+            history_table_name(obj) for obj in HISTORY_STANDARD_OBJECTS + custom_objects
+        ]
+        return standard_tables + history_tables + self._non_crm.list_tables()
 
     def _discover_custom_objects(self, require_access: bool = False) -> List[str]:
         """
@@ -346,6 +366,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 or alias in NON_CRM_TABLES
                 or alias in custom_types
                 or object_type in names_by_type
+                or is_history_table(alias)
             ):
                 raise RuntimeError("HubSpot custom schema has a conflicting identity")
             custom_types[alias] = object_type
@@ -407,6 +428,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 f"Supported tables are: {supported_tables}"
             )
 
+        if is_history_table(table_name):
+            return self._history.get_table_schema()
         if "associations" in table_options:
             self._get_associations_for_object(table_name, table_options)
         self._association_value_mode(table_options)
@@ -469,6 +492,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 f"Supported tables are: {supported_tables}"
             )
 
+        if is_history_table(table_name):
+            return self._history.get_table_metadata()
         if "associations" in table_options:
             self._get_associations_for_object(table_name, table_options)
         self._association_value_mode(table_options)
@@ -725,6 +750,8 @@ class HubspotLakeflowConnect(LakeflowConnect):
                 f"Supported tables are: {supported_tables}"
             )
 
+        if is_history_table(table_name):
+            return self._history.read_table(table_name, start_offset, table_options)
         if "associations" in table_options:
             self._get_associations_for_object(table_name, table_options)
         self._association_value_mode(table_options)
@@ -828,6 +855,15 @@ class HubspotLakeflowConnect(LakeflowConnect):
             raise RuntimeError("Malformed HubSpot archive timestamp timezone")
         return parsed.astimezone(timezone.utc)
 
+    def read_table_between_offsets(self, table_name, start_offset, end_offset, table_options):
+        """Replay a recorded history scan. Other tables read forward from the start offset."""
+        if is_history_table(table_name):
+            return self._history.read_between_offsets(
+                table_name, start_offset, end_offset, table_options or {}
+            )
+        rows, _offset = self.read_table(table_name, start_offset, table_options)
+        return rows
+
     def read_table_deletes(self, table_name, start_offset, table_options):
         """Reconcile all archived pages in a frozen window before checkpointing.
 
@@ -835,7 +871,7 @@ class HubspotLakeflowConnect(LakeflowConnect):
         this scan without skipping older archive times on later pages.
         """
         start = start_offset or {}
-        if table_name in NON_CRM_TABLES:
+        if table_name in NON_CRM_TABLES or is_history_table(table_name):
             return iter([]), start
         if table_name not in self.list_tables():
             raise ValueError(f"Unsupported table: {table_name}")

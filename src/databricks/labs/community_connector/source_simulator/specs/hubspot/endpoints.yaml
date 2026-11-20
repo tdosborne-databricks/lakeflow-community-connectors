@@ -8,6 +8,9 @@
 #   discover field types from the v3 results wrapper.
 # * ``read_table`` → GET ``/crm/objects/2026-09/{table}`` first call;
 #   POST ``/crm/objects/2026-09/{table}/search`` for incremental reads.
+# * ``{object}_property_history`` tables → POST ``.../search`` for changed IDs,
+#   then POST ``/crm/objects/2026-09/{object}/batch/read`` from the
+#   ``{object}_history`` corpus.
 #
 # Response wrapper for listing endpoints: ``{"results": [...], "paging": {}}``
 # with paging empty so the connector terminates after one page.
@@ -145,3 +148,9 @@ endpoints:
     corpus: notes
     handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.search:serve_search
     synthesize_future_records: {cursor_field: updatedAt, count: 3}
+
+  # Property history. Search selects parent ids. Batch read returns
+  # propertiesWithHistory from the {object}_history corpus.
+  - path: /crm/objects/2026-09/{object_type}/batch/read
+    method: POST
+    handler: databricks.labs.community_connector.source_simulator.specs.hubspot.handlers.batch_read:serve_batch_read

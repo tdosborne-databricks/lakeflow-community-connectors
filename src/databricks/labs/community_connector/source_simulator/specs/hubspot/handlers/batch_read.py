@@ -3,12 +3,48 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any
 
 from requests.models import PreparedRequest, Response
 
 from databricks.labs.community_connector.source_simulator.cassette import ResponseRecord
 from databricks.labs.community_connector.source_simulator.interceptor import response_from_record
+
+
+_PATH_RE = re.compile(r"/crm/objects/2026-09/(?P<object_type>[^/]+)/batch/read")
+
+
+def serve_batch_read(prep: PreparedRequest, spec: Any, corpus: Any) -> Response:
+    """Serve propertiesWithHistory for the ids named in a batch-read body."""
+    del spec
+    match = _PATH_RE.search(prep.url or "")
+    if not match:
+        return _build_response(prep, status=404, payload={"message": "unknown path"})
+    object_type = match.group("object_type")
+    body = _parse_body(prep.body)
+    wanted_ids = {
+        str(item.get("id")) for item in body.get("inputs") or [] if isinstance(item, dict)
+    }
+    wanted_props = set(body.get("propertiesWithHistory") or [])
+    records = corpus.get(f"{object_type}_history") or []
+    results = []
+    for record in records:
+        if str(record.get("id")) not in wanted_ids:
+            continue
+        history = record.get("propertiesWithHistory") or {}
+        copied = dict(record)
+        copied["propertiesWithHistory"] = {
+            key: value for key, value in history.items() if not wanted_props or key in wanted_props
+        }
+        results.append(copied)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return _build_response(
+        prep,
+        status=200,
+        payload={"status": "COMPLETE", "results": results, "startedAt": now, "completedAt": now},
+    )
 
 
 def _parse_body(raw: Any) -> dict:
